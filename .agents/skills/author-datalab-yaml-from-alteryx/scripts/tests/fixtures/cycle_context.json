@@ -1,0 +1,64 @@
+{
+  "workflow": "cycle_fixture.yxmd",
+  "sha256": "",
+  "tool_count": 2,
+  "sources": [],
+  "tables": [
+    {
+      "table": "silver_a",
+      "unity_catalog_name": "silver_a",
+      "layer": "silver",
+      "container": "C1",
+      "notebook": "02_silver.ipynb",
+      "status": "ok",
+      "reads_sources": [],
+      "reads_tables": ["silver_b"],
+      "chain": "Join [1]",
+      "tools": [1]
+    },
+    {
+      "table": "silver_b",
+      "unity_catalog_name": "silver_b",
+      "layer": "silver",
+      "container": "C1",
+      "notebook": "02_silver.ipynb",
+      "status": "ok",
+      "reads_sources": [],
+      "reads_tables": ["silver_a"],
+      "chain": "Join [2]",
+      "tools": [2]
+    }
+  ],
+  "tools": [
+    {
+      "id": 1,
+      "name": "Join",
+      "plugin": "AlteryxBasePluginsGui.Join.Join",
+      "container": "C1",
+      "status": "converted by rule",
+      "missing": false,
+      "tables": ["silver_a"],
+      "upstream": [],
+      "downstream": [],
+      "code_table": "silver_a",
+      "code": "# [1] Join\nsilver_a = silver_b.join(other, 'id')"
+    },
+    {
+      "id": 2,
+      "name": "Join",
+      "plugin": "AlteryxBasePluginsGui.Join.Join",
+      "container": "C1",
+      "status": "converted by rule",
+      "missing": false,
+      "tables": ["silver_b"],
+      "upstream": [],
+      "downstream": [],
+      "code_table": "silver_b",
+      "code": "# [2] Join\nsilver_b = silver_a.join(other, 'id')"
+    }
+  ],
+  "missing": [],
+  "macros_missing": [],
+  "decisions": {},
+  "decided_for_you": {}
+}
