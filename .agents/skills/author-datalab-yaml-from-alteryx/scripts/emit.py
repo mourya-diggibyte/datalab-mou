@@ -814,7 +814,7 @@ def emit_classification_json(
 
 
 # ---------------------------------------------------------------------------
-# migration_review.md (Task 8 — stub only)
+# migration_review.md (Task 8 — full implementation)
 # ---------------------------------------------------------------------------
 
 
@@ -826,10 +826,14 @@ def emit_review_md(
     out: Path,
     generated_at: datetime | None = None,
 ) -> Path:
-    """Write ``projects/<domain>/migration_review.md``.
+    """Write ``projects/<domain>/migration_review.md`` — the human hand-off.
 
-    Full implementation (all sections) arrives in Task 8. This stub writes a minimal
-    header so the file exists and the path is stable.
+    Sections:
+    - Header (workflow, sha256, domain, generated-at, counts)
+    - Dependency order (topo order + fan-in/out)
+    - Tables (layer, file path, confidence, transform y/n + why, review notes)
+    - Needs your attention (low/medium items, gaps, macros_missing, Unique warnings)
+    - Dropped on purpose (Browse/no-effect/dead-branch tools)
     """
     target = out / "migration_review.md"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -837,24 +841,169 @@ def emit_review_md(
     if generated_at is None:
         generated_at = datetime.now(UTC)
 
-    lines = [
+    # Counts
+    n_tables = len(ctx.tables)
+    n_sources = len(ctx.sources)
+    n_transforms = sum(1 for td in decisions.values() if td.needs_transform)
+    n_gaps = sum(len(td.gaps) for td in decisions.values())
+    n_dropped = sum(len(td.dropped) for td in decisions.values())
+    n_low = sum(1 for td in decisions.values() if str(td.confidence) == "low")
+    n_medium = sum(1 for td in decisions.values() if str(td.confidence) == "medium")
+
+    lines: list[str] = [
         f"# Migration review — {domain}",
         "",
         "| Field | Value |",
         "|---|---|",
         f"| Workflow | `{ctx.workflow}` |",
-        f"| SHA-256 | `{ctx.sha256[:12]}…` |",
+        f"| SHA-256 | `{ctx.sha256[:16]}…` |",
         f"| Domain | `{domain}` |",
         f"| Generated | {generated_at.strftime('%Y-%m-%d %H:%M UTC')} |",
-        f"| Tables | {len(ctx.tables)} |",
-        f"| Sources | {len(ctx.sources)} |",
+        f"| Output tables | {n_tables} |",
+        f"| Source tables | {n_sources} |",
+        f"| @transform functions | {n_transforms} |",
+        f"| Gap tools (route to LLM/review) | {n_gaps} |",
+        f"| Dropped tools | {n_dropped} |",
+        f"| Low-confidence tables | {n_low} |",
+        f"| Medium-confidence tables | {n_medium} |",
         f"| Macros missing | {', '.join(ctx.macros_missing) or 'none'} |",
         "",
-        "> Full review sections (Dependency order, Tables, Needs your attention, "
-        "Dropped on purpose) are emitted in Task 8.",
-        "",
-        depgraph.render_order(graph, ctx),
     ]
+
+    # Section 1: Dependency order
+    lines.append(depgraph.render_order(graph, ctx))
+    lines.append("")
+
+    # Section 2: Tables
+    lines += [
+        "## Tables",
+        "",
+        "| Table | Layer | File | Confidence | Transform | Notes |",
+        "|---|---|---|---|---|---|",
+    ]
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td is None:
+            continue
+        conf = str(td.confidence)
+        rel_file = f"`config/{domain}/{tbl.layer}/{tbl.table}.yml`"
+        has_transform = "yes" if td.needs_transform else "no"
+        why = ""
+        if td.needs_transform:
+            transform_tools = [t for t in td.tool_decisions if str(t.bucket) == "transform"]
+            why = "; ".join(t.name for t in transform_tools)
+        notes_short = "; ".join(tbl.review_notes[:1]) if tbl.review_notes else ""
+        lines.append(f"| `{tbl.table}` | {tbl.layer} | {rel_file} | {conf} | {has_transform} {why} | {notes_short} |")
+    lines.append("")
+
+    # Section 3: Sources emitted as bronze
+    lines += [
+        "## Bronze sources",
+        "",
+        "| Source key | Alteryx source file | Macro missing | Bronze file |",
+        "|---|---|---|---|",
+    ]
+    for src in ctx.sources:
+        src_files = ", ".join(src.source_tables) if src.source_tables else "—"
+        macro = "yes" if ctx.macros_missing else "no"
+        lines.append(
+            f"| `{src.table_key}` | {src_files} | {macro} | "
+            f"`config/{domain}/bronze/{src.table_key}.yml` |"
+        )
+    lines.append("")
+
+    # Section 4: Needs your attention
+    lines += ["## Needs your attention", ""]
+    attention: list[str] = []
+
+    # Macros missing
+    for macro in ctx.macros_missing:
+        attention.append(
+            f"- **MISSING MACRO `{macro}`** — the bronze source YAML has a placeholder "
+            "`path_conf`; set the real landing path conf key before running."
+        )
+
+    # Low-confidence tables
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td and str(td.confidence) == "low":
+            reasons = [t.reason for t in td.tool_decisions if str(t.confidence) == "low"]
+            attention.append(
+                f"- **LOW confidence** `{tbl.table}` ({tbl.layer}): "
+                + "; ".join(reasons[:2])
+            )
+
+    # Gap tools
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td and td.gaps:
+            for gap in td.gaps:
+                attention.append(
+                    f"- **GAP** `{tbl.table}` — tool [{gap.tool_id}] `{gap.name}`: "
+                    f"{gap.reason} → route to LLM or review"
+                )
+
+    # Unique(any) survivor-arbitrariness warning
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td:
+            for tool_d in td.tool_decisions:
+                if "dropduplicates" in tool_d.construct.lower():
+                    attention.append(
+                        f"- **Unique(any) in `{tbl.table}`** — `dropDuplicates` may keep a "
+                        "different row than Alteryx did (no stable order key). If row identity "
+                        "matters, add a `sequence_by` key and switch to `target.cdc`."
+                    )
+
+    # Output tools recorded as EXPORT
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td:
+            for tool_d in td.dropped:
+                if "EXPORT" in tool_d.construct:
+                    attention.append(
+                        f"- **OUTPUT TOOL** `{tool_d.name}` in `{tbl.table}` — not wired as a "
+                        f"datalab sink; add an export step after the table if needed. "
+                        f"({tool_d.construct})"
+                    )
+
+    # Medium-confidence items (listed briefly)
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td and str(td.confidence) == "medium":
+            medium_tools = [t for t in td.tool_decisions if str(t.confidence) == "medium"]
+            for mt in medium_tools:
+                attention.append(
+                    f"- **MEDIUM confidence** `{tbl.table}` — [{mt.name}]: {mt.reason}"
+                )
+
+    if attention:
+        lines += attention
+    else:
+        lines.append("_Nothing flagged — all tables are high confidence._")
+    lines.append("")
+
+    # Section 5: Dropped on purpose
+    lines += ["## Dropped on purpose", ""]
+    dropped_items: list[str] = []
+    for tbl in ctx.tables:
+        td = decisions.get(tbl.table)
+        if td and td.dropped:
+            for d in td.dropped:
+                dropped_items.append(
+                    f"- `{tbl.table}` — [{d.tool_id}] `{d.name}`: {d.reason}"
+                )
+    # Also pick up tools with no table (Browse, etc.) from full tools list
+    for tool in ctx.tools:
+        if not tool.tables and tool.is_dropped:
+            dropped_items.append(
+                f"- (no table) — [{tool.id}] `{tool.name}`: {tool.status}"
+            )
+    if dropped_items:
+        lines += dropped_items
+    else:
+        lines.append("_No tools were dropped._")
+    lines.append("")
 
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target

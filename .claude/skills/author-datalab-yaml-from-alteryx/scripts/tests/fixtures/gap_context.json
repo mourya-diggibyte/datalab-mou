@@ -1,0 +1,63 @@
+{
+  "workflow": "gap_test.yxmd",
+  "sha256": "bbbb0000000000000000000000000000000000000000000000000000000000000000",
+  "tool_count": 2,
+  "sources": [
+    {
+      "table_key": "bronze_raw",
+      "unity_catalog_name": "bronze_raw",
+      "alteryx_tools": [1],
+      "source_tables": [],
+      "query": "",
+      "query_translated": false
+    }
+  ],
+  "tables": [
+    {
+      "table": "gold_complex",
+      "unity_catalog_name": "gold_complex",
+      "layer": "gold",
+      "container": "C",
+      "notebook": "03_gold.ipynb",
+      "status": "ok",
+      "reads_sources": ["bronze_raw"],
+      "reads_tables": [],
+      "chain": "SpatialMatch [2]",
+      "tools": [1, 2],
+      "spark_sql": false,
+      "no_sql_reason": "",
+      "review_notes": ["AI-WRITTEN code — review before use"]
+    }
+  ],
+  "tools": [
+    {
+      "id": 1,
+      "name": "google-sheets-input",
+      "plugin": "google-sheets-input",
+      "container": "C",
+      "status": "source",
+      "missing": false,
+      "tables": [],
+      "upstream": [],
+      "downstream": [{"id": 2, "name": "SpatialMatch", "from_anchor": "Output", "to_anchor": "Input"}],
+      "code": ""
+    },
+    {
+      "id": 2,
+      "name": "SpatialMatch",
+      "plugin": "AlteryxSpatialPluginsGui.SpatialMatch",
+      "container": "C",
+      "status": "written by the model (AI-WRITTEN: review before use)",
+      "missing": true,
+      "tables": ["gold_complex"],
+      "upstream": [{"id": 1, "name": "google-sheets-input", "from_anchor": "Output", "to_anchor": "Input"}],
+      "downstream": [],
+      "code": "# [2] SpatialMatch\n# AI-WRITTEN: review before use\ngold_complex = bronze_raw.filter(F.col('lat').isNotNull())",
+      "reason": "SpatialMatch is not supported by this converter"
+    }
+  ],
+  "missing": ["SpatialMatch"],
+  "macros_missing": [],
+  "decisions": {},
+  "decided_for_you": {}
+}

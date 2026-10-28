@@ -1,0 +1,39 @@
+{
+  "workflow": "dangling_fixture.yxmd",
+  "sha256": "",
+  "tool_count": 1,
+  "sources": [],
+  "tables": [
+    {
+      "table": "gold_orphan",
+      "unity_catalog_name": "gold_orphan",
+      "layer": "gold",
+      "container": "C1",
+      "notebook": "03_gold.ipynb",
+      "status": "ok",
+      "reads_sources": [],
+      "reads_tables": ["silver_never_produced"],
+      "chain": "Select [1]",
+      "tools": [1]
+    }
+  ],
+  "tools": [
+    {
+      "id": 1,
+      "name": "Select",
+      "plugin": "AlteryxBasePluginsGui.AlteryxSelect.AlteryxSelect",
+      "container": "C1",
+      "status": "converted by rule",
+      "missing": false,
+      "tables": ["gold_orphan"],
+      "upstream": [],
+      "downstream": [],
+      "code_table": "gold_orphan",
+      "code": "# [1] Select\ngold_orphan = silver_never_produced.select('*')"
+    }
+  ],
+  "missing": [],
+  "macros_missing": [],
+  "decisions": {},
+  "decided_for_you": {}
+}
