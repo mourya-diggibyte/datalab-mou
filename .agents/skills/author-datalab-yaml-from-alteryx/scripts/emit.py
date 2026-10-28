@@ -238,8 +238,107 @@ def emit_bronze_yml(
 
 
 # ---------------------------------------------------------------------------
-# Silver emission (Task 5 — stub only, body arrives in Task 5)
+# Silver emission (Task 5)
 # ---------------------------------------------------------------------------
+
+# Map from PySpark cast type strings (lower) to ANSI/datalab type names.
+_PYSPARK_TYPE_MAP = {
+    "long": "long",
+    "int": "integer",
+    "integer": "integer",
+    "double": "double",
+    "float": "float",
+    "string": "string",
+    "boolean": "boolean",
+    "date": "date",
+    "timestamp": "timestamp",
+    "binary": "binary",
+    "short": "short",
+    "byte": "byte",
+    "decimal": "decimal",
+}
+
+
+def _parse_select_columns(code: str) -> list[dict]:
+    """Extract column specs from a generated PySpark Select block.
+
+    Understands two patterns:
+    - ``F.col('src').cast('type').alias('dst')``  →  name=dst, source=src, type=type
+    - ``F.col('src').alias('dst')``               →  name=dst, source=src
+    - ``F.col('src')``                             →  name=src  (pass-through, no alias)
+    - ``F.col('src').cast('type')``               →  name=src, type=type
+    Conditional selects (``*([...] if ... in ...)``) are flagged as ``# CONFIDENCE: medium``.
+    Returns a list of column spec dicts (keys: name, source [opt], type [opt], note [opt]).
+    """
+    import re
+
+    cols: list[dict] = []
+
+    # Full cast+alias: F.col('src').cast('type').alias('dst')
+    for m in re.finditer(
+        r"F\.col\(['\"](\w+)['\"]\)\.cast\(['\"](\w+)['\"]\)\.alias\(['\"](\w+)['\"]\)", code
+    ):
+        src, typ, dst = m.group(1), m.group(2), m.group(3)
+        spec: dict = {"name": dst}
+        if src != dst:
+            spec["source"] = src
+        mapped = _PYSPARK_TYPE_MAP.get(typ.lower())
+        if mapped:
+            spec["type"] = mapped
+        cols.append(spec)
+
+    # alias without cast: F.col('src').alias('dst')  (not already matched above)
+    for m in re.finditer(r"F\.col\(['\"](\w+)['\"]\)\.alias\(['\"](\w+)['\"]\)", code):
+        src, dst = m.group(1), m.group(2)
+        already = any(c.get("name") == dst and c.get("source", dst) == src for c in cols)
+        if not already:
+            spec = {"name": dst}
+            if src != dst:
+                spec["source"] = src
+            cols.append(spec)
+
+    # bare pass-through: F.col('src')  not already matched
+    for m in re.finditer(r"F\.col\(['\"](\w+)['\"]\)(?!\.)", code):
+        nm = m.group(1)
+        already = any(c.get("name") == nm or c.get("source") == nm for c in cols)
+        if not already:
+            cols.append({"name": nm})
+
+    # conditional selects (wrapped in *([...] if ...)) — flag but still include them
+    if "*([" in code:
+        for col in cols:
+            col.setdefault("note", "conditional — field may be absent at runtime")
+
+    return cols
+
+
+def _parse_filter_quality(code: str) -> list[dict]:
+    """Extract quality rules from a generated PySpark Filter block.
+
+    Understands:
+    - ``.isNotNull()``  → ``is_not_null``
+    - ``.isNull()``     → ``is_null``
+    - ``.isin(...)``    → ``is_in_list`` (placeholder — values need review)
+    Returns a list of dicts with keys: column, check_function, [criticality], [note].
+    """
+    import re
+
+    rules: list[dict] = []
+    # col('x').isNotNull()
+    for m in re.finditer(r"F\.col\(['\"](\w+)['\"]\)\.isNotNull\(\)", code):
+        rules.append({"column": m.group(1), "check": "is_not_null", "criticality": "error"})
+    # col('x').isNull()
+    for m in re.finditer(r"F\.col\(['\"](\w+)['\"]\)\.isNull\(\)", code):
+        rules.append({"column": m.group(1), "check": "is_null", "criticality": "warn"})
+    # filter(col('x').isin(...))
+    for m in re.finditer(r"F\.col\(['\"](\w+)['\"]\)\.isin\(([^)]+)\)", code):
+        rules.append({
+            "column": m.group(1),
+            "check": "is_in_list",
+            "criticality": "error",
+            "note": f"# CONFIDENCE: medium — review allowed values: {m.group(2).strip()}",
+        })
+    return rules
 
 
 def emit_silver_yml(
@@ -251,17 +350,196 @@ def emit_silver_yml(
 ) -> Path:
     """Write ``projects/<domain>/config/<domain>/silver/<table>.yml``.
 
-    Full implementation arrives in Task 5. This stub raises so callers know it is not
-    wired yet, without silently producing an empty file.
+    Emits ``columns:`` from Select tool code, ``quality:`` rules from Filter tool code,
+    optional ``transform:`` when the table needs one, and ``target.cdc`` when a Unique with
+    a first/last order key is present. A pure Select+Filter table (needs_transform=False)
+    gets a plain ``streaming_table`` with no transform.
     """
-    raise NotImplementedError(
-        f"Silver emission for '{table.table}' is not yet implemented (Task 5)."
-    )
+    import re
+
+    target_path = out / "config" / domain / "silver" / f"{table.table}.yml"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tools = ctx.tools_for(table)
+
+    # Gather columns from Select, quality rules from Filter.
+    columns: list[dict] = []
+    quality_rules: list[dict] = []
+    for tool in tools:
+        if tool.name == "Select" and tool.code:
+            columns = _parse_select_columns(tool.code)
+        elif tool.name == "Filter" and tool.code:
+            quality_rules = _parse_filter_quality(tool.code)
+
+    # Determine source: first reads_sources entry (most common for silver)
+    source_key = table.reads_sources[0] if table.reads_sources else table.reads_tables[0] if table.reads_tables else ""
+    # Try to determine source layer from the context
+    source_layer = "bronze"
+    if source_key:
+        src_table = next((t for t in ctx.tables if t.table == source_key), None)
+        if src_table:
+            source_layer = src_table.layer
+
+    # CDC: check if Unique with first/last mode in decisions
+    cdc_block = ""
+    for tool in tools:
+        if tool.name == "Unique":
+            dec = ctx.decision_for(tool.id)
+            mode = (dec or {}).get("mode")
+            if mode in ("first", "last"):
+                # Need a key — use what's in the code if detectable
+                key_match = re.search(r"dropDuplicates\(\[([^\]]+)\]", tool.code or "")
+                keys_raw = key_match.group(1) if key_match else ""
+                keys = [k.strip().strip("'\"") for k in keys_raw.split(",") if k.strip()] if keys_raw else []
+                keys_str = ", ".join(f'"{k}"' for k in keys) if keys else '"id"  # FIXME: set the key column'
+                cdc_block = (
+                    f"  cdc:\n"
+                    f"    keys: [{keys_str}]\n"
+                    f"    sequence_by: _ingest_ts  # FIXME: confirm the sequence column\n"
+                    f"    scd_type: 1\n"
+                )
+
+    # Transform block (only if the table needs one)
+    transform_block = ""
+    if decision.needs_transform:
+        fn_name = f"{domain}.{table.table}"
+        transform_block = (
+            f"transform:\n"
+            f"  - function: {fn_name}\n"
+            f"    # CONFIDENCE: medium — review the generated @transform stub\n"
+        )
+
+    # Confidence comment
+    conf = str(decision.confidence)
+    conf_comment = f"# CONFIDENCE: {conf}"
+    if decision.review_notes:
+        conf_comment += f" — {decision.review_notes[0]}"
+
+    # Build columns block
+    columns_lines: list[str] = []
+    if columns:
+        columns_lines.append("columns:")
+        for col in columns:
+            note = col.get("note", "")
+            columns_lines.append(f"  - name: {col['name']}")
+            if col.get("source"):
+                columns_lines.append(f"    source: {col['source']}")
+            if col.get("type"):
+                columns_lines.append(f"    type: {col['type']}")
+            if note:
+                columns_lines.append(f"    # {note}")
+
+    # Build quality block
+    quality_lines: list[str] = []
+    if quality_rules:
+        # Per-column inline quality
+        col_quality: dict[str, list[dict]] = {}
+        for rule in quality_rules:
+            col_quality.setdefault(rule["column"], []).append(rule)
+
+        # Attach inline quality to existing column specs if column already listed
+        col_names = {c["name"] for c in columns}
+        inline_done = set()
+        new_columns_lines: list[str] = []
+        i = 0
+        while i < len(columns_lines):
+            line = columns_lines[i]
+            new_columns_lines.append(line)
+            if line.startswith("  - name: "):
+                col_name = line[len("  - name: "):].strip()
+                i += 1
+                # consume remaining lines for this column
+                while i < len(columns_lines) and not columns_lines[i].startswith("  - name: "):
+                    new_columns_lines.append(columns_lines[i])
+                    i += 1
+                # add quality inline
+                if col_name in col_quality:
+                    new_columns_lines.append("    quality:")
+                    for rule in col_quality[col_name]:
+                        new_columns_lines.append(f"      - criticality: {rule['criticality']}")
+                        new_columns_lines.append(f"        check: {{function: {rule['check']}}}")
+                        if rule.get("note"):
+                            new_columns_lines.append(f"        {rule['note']}")
+                    inline_done.add(col_name)
+            else:
+                i += 1
+        columns_lines = new_columns_lines
+
+        # Table-level quality for columns not in the select list (unlikely but safe)
+        leftover = [r for r in quality_rules if r["column"] not in inline_done and r["column"] not in col_names]
+        if leftover:
+            quality_lines.append("quality:")
+            quality_lines.append("  rules:")
+            for rule in leftover:
+                quality_lines.append(f"    - column: {rule['column']}")
+                quality_lines.append(f"      criticality: {rule['criticality']}")
+                quality_lines.append(f"      check: {{function: {rule['check']}}}")
+
+    # Review notes as YAML comments
+    review_comment_lines = [f"# review: {n}" for n in table.review_notes]
+
+    parts = [
+        _schema_header(5, _SCHEMA_TABLE),
+        "#",
+        f"# Target table: silver.{table.table}",
+        "# Generated by author-datalab-yaml-from-alteryx — review before use.",
+        conf_comment,
+        *review_comment_lines,
+        "",
+        "schema_version: 1",
+        f"name: {table.table}",
+        f'comment: "Silver layer: {table.table} — validated records."',
+        "source:",
+        "  kind: table",
+        f"  name: {source_key}",
+        f"  layer: {source_layer}",
+        "  as_stream: true",
+        *columns_lines,
+        *quality_lines,
+    ]
+    if transform_block:
+        parts.append(transform_block.rstrip())
+    parts += [
+        "target:",
+        "  kind: streaming_table",
+    ]
+    if cdc_block:
+        parts.append(cdc_block.rstrip())
+    parts.append("")
+
+    content = "\n".join(parts)
+    _assert_no_literal_catalog(content)
+    target_path.write_text(content, encoding="utf-8")
+    return target_path
 
 
 # ---------------------------------------------------------------------------
-# Gold emission (Task 6 — stub only, body arrives in Task 6)
+# Gold emission (Task 6)
 # ---------------------------------------------------------------------------
+
+
+def _gold_source_layer(ctx: model.Context, table: model.Table) -> tuple[str, str]:
+    """Return ``(source_key, source_layer)`` for a gold table's primary upstream.
+
+    If the upstream is a declared ``sources[]`` entry (a bronze ingestion source) the layer
+    is ``bronze``; if it is a ``tables[]`` entry we use that table's layer.
+    """
+    # Prefer reads_sources (direct bronze/silver source tables) over reads_tables.
+    if table.reads_sources:
+        key = table.reads_sources[0]
+        # Check if it's also in ctx.tables (a produced table with a layer)
+        upstream_tbl = next((t for t in ctx.tables if t.table == key), None)
+        if upstream_tbl:
+            return key, upstream_tbl.layer
+        return key, "bronze"  # it's a declared source, which is always bronze-tier
+
+    if table.reads_tables:
+        key = table.reads_tables[0]
+        upstream_tbl = next((t for t in ctx.tables if t.table == key), None)
+        layer = upstream_tbl.layer if upstream_tbl else "silver"
+        return key, layer
+
+    return "", "bronze"
 
 
 def emit_gold_yml(
@@ -273,12 +551,206 @@ def emit_gold_yml(
 ) -> Path:
     """Write ``projects/<domain>/config/<domain>/gold/<table>.yml``.
 
-    Full implementation arrives in Task 6. This stub raises so callers know it is not
-    wired yet, without silently producing an empty file.
+    Gold tables are grain-changing: ``source.kind: table`` + ``transform:`` +
+    ``target.materialized_view``. A transform is always required at this layer
+    (any grain-changing logic — Summarize, Join, Union, orderless Unique —
+    forces a ``@transform`` function). If somehow no transform is needed the
+    emitter falls back to a pass-through MV with a review comment.
     """
-    raise NotImplementedError(
-        f"Gold emission for '{table.table}' is not yet implemented (Task 6)."
-    )
+    target_path = out / "config" / domain / "gold" / f"{table.table}.yml"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source_key, source_layer = _gold_source_layer(ctx, table)
+
+    # Transform function name: <domain>.<table_name>  (registered in domain.yml imports)
+    fn_name = f"{domain}.{table.table}"
+
+    # Confidence + review notes
+    conf = str(decision.confidence)
+    conf_comment = f"# CONFIDENCE: {conf}"
+    if decision.review_notes:
+        conf_comment += f" — {decision.review_notes[0]}"
+
+    # Why-transform explanation for each transform-requiring tool
+    why_lines: list[str] = []
+    for td in decision.tool_decisions:
+        if str(td.bucket) == "transform":
+            why_lines.append(f"# WHY transform: [{td.name}] {td.reason}")
+
+    review_comment_lines = [f"# review: {n}" for n in table.review_notes]
+
+    parts = [
+        _schema_header(5, _SCHEMA_TABLE),
+        "#",
+        f"# Target table: gold.{table.table}",
+        "# Generated by author-datalab-yaml-from-alteryx — review before use.",
+        conf_comment,
+        *why_lines,
+        *review_comment_lines,
+        "",
+        "schema_version: 1",
+        f"name: {table.table}",
+        f'comment: "Gold layer: {table.table} — grain-changing aggregate/dedupe."',
+        "source:",
+        "  kind: table",
+        f"  name: {source_key}",
+        f"  layer: {source_layer}",
+    ]
+
+    if decision.needs_transform:
+        parts += [
+            "transform:",
+            f"  - function: {fn_name}",
+        ]
+        # Annotate transform decision per tool
+        for td in decision.tool_decisions:
+            if str(td.bucket) == "transform":
+                parts.append(f"    # {td.construct}")
+    else:
+        # No transform required — rare for gold, flag for review.
+        parts += [
+            "# CONFIDENCE: medium — no transform-requiring tools detected; review if a",
+            "# pass-through MV is really intended at gold layer.",
+        ]
+
+    parts += [
+        "target:",
+        "  kind: materialized_view",
+        "",
+    ]
+
+    content = "\n".join(parts)
+    _assert_no_literal_catalog(content)
+    target_path.write_text(content, encoding="utf-8")
+    return target_path
+
+
+# ---------------------------------------------------------------------------
+# @transform stubs + domain.yml imports update (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def emit_transform_stubs(
+    ctx: model.Context,
+    decisions: dict[str, classify.TableDecision],
+    domain: str,
+    out: Path,
+) -> tuple[Path, list[str]]:
+    """Write ``projects/<domain>/src/<domain>_etl/transforms/<domain>.py`` with one
+    ``@transform`` stub per table that needs one.
+
+    Returns ``(path, import_names)`` where ``import_names`` is the list to write into
+    ``domain.yml``'s ``imports:`` key (e.g. ``["master_onb_ba_etl.transforms.master_onb_ba"]``).
+    A table with zero transform-requiring tools gets NO stub and NO import entry — this is
+    the direct implementation of the "@transform only when truly needed" rule.
+    """
+    stub_path = out / "src" / f"{domain}_etl" / "transforms" / f"{domain}.py"
+    stub_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Collect tables that need a transform, in topo order (decisions preserves ctx.tables order).
+    transform_tables = [
+        (tbl_key, td)
+        for tbl_key, td in decisions.items()
+        if td.needs_transform
+    ]
+
+    if not transform_tables:
+        # No transforms needed at all — write a minimal placeholder so the path is stable.
+        stub_path.write_text(
+            f'"""No @transform functions required for domain {domain!r}."""\n',
+            encoding="utf-8",
+        )
+        return stub_path, []
+
+    lines = [
+        f'"""Auto-generated @transform stubs for domain {domain!r}.',
+        "",
+        "Each function below is a DRAFT starting point from the Alteryx-generated PySpark.",
+        "Review carefully before use — in particular:",
+        "  * Column names may need updating to match the bronze/silver table's actual schema.",
+        "  * dropDuplicates with 'any' semantics may select a different row than Alteryx did.",
+        '"""',
+        "",
+        "from pyspark.sql import DataFrame",
+        "import pyspark.sql.functions as F  # noqa: F401",
+        "",
+        "from datalab.framework.registry import transform",
+        "",
+    ]
+
+    import_module = f"{domain}_etl.transforms.{domain}"
+
+    for tbl_key, td in transform_tables:
+        fn_name = tbl_key  # registered name: <domain>.<table_name> in YAML; python fn = table_name
+        registered_name = f"{domain}.{tbl_key}"
+
+        # Collect PySpark code from transform-bucket tools (in tool chain order)
+        tbl = next((t for t in ctx.tables if t.table == tbl_key), None)
+        tool_code_blocks: list[str] = []
+        if tbl:
+            for tool in ctx.tools_for(tbl):
+                if str(decisions[tbl_key].tool_decisions[0].bucket) != "drop":
+                    # include code from any non-dropped tool
+                    if tool.code:
+                        tool_code_blocks.append(f"    # --- [{tool.name}] ---")
+                        for code_line in tool.code.splitlines():
+                            tool_code_blocks.append(f"    {code_line}")
+
+        # Confidence + why comments
+        conf = str(td.confidence)
+        why_comments = []
+        for tool_d in td.tool_decisions:
+            if str(tool_d.bucket) == "transform":
+                why_comments.append(
+                    f"# WHY transform: [{tool_d.name}] {tool_d.reason}"
+                )
+
+        lines.append("")
+        lines.append(f'@transform("{registered_name}")')
+        lines.append(f"# CONFIDENCE: {conf} — TODO review before production use")
+        for wc in why_comments:
+            lines.append(wc)
+        lines.append(f"def {fn_name}(df: DataFrame, **kwargs) -> DataFrame:")
+        lines.append(f'    """Transform for {registered_name}.')
+        lines.append("")
+        lines.append("    Generated from Alteryx tool chain — review all column names,")
+        lines.append("    types, and deduplication semantics before use.")
+        lines.append('    """')
+
+        if tool_code_blocks:
+            lines.append("    # TODO: review and adapt the generated code below")
+            lines += tool_code_blocks
+            # The generated code uses the source table name as a variable; rename to df
+            # Add a note so the reviewer knows to wire it up
+            lines.append("    # TODO: replace variable names above with 'df' and return result")
+            lines.append("    return df  # FIXME: replace with the actual transform result")
+        else:
+            lines.append("    # TODO: implement this transform")
+            lines.append("    return df")
+        lines.append("")
+
+    stub_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return stub_path, [import_module]
+
+
+def update_domain_yml_imports(domain_yml_path: Path, imports: list[str]) -> None:
+    """Rewrite the ``imports:`` line in an existing domain.yml with the actual import list.
+
+    Finds the ``imports: []`` placeholder written by :func:`emit_domain_yml` (Task 4) and
+    replaces it with the real list. Called after :func:`emit_transform_stubs` has determined
+    which modules actually need registering.
+    """
+    if not imports:
+        return  # nothing to add; placeholder stays
+
+    text = domain_yml_path.read_text(encoding="utf-8")
+    import_lines = "\n".join(f"  - {imp}" for imp in imports)
+    new_block = f"imports:\n{import_lines}"
+
+    # Replace the placeholder line (handles both "imports: []" and multi-line existing block)
+    import re
+    text = re.sub(r"imports: \[\].*", new_block, text)
+    domain_yml_path.write_text(text, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

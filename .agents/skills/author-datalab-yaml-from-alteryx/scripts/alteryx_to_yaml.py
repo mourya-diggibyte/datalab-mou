@@ -193,26 +193,29 @@ def main(argv: list[str] | None = None) -> int:
             continue  # source node, already handled above
         td = decisions[tbl.table]
         if tbl.layer == "silver":
-            try:
-                p = emit.emit_silver_yml(ctx, tbl, td, domain, out)
-                written.append(p)
-                print(f"  wrote {p.as_posix()}")
-            except NotImplementedError as exc:
-                print(f"  [skip] {exc}")
+            p = emit.emit_silver_yml(ctx, tbl, td, domain, out)
+            written.append(p)
+            print(f"  wrote {p.as_posix()}")
         elif tbl.layer == "gold":
-            try:
-                p = emit.emit_gold_yml(ctx, tbl, td, domain, out)
-                written.append(p)
-                print(f"  wrote {p.as_posix()}")
-            except NotImplementedError as exc:
-                print(f"  [skip] {exc}")
+            p = emit.emit_gold_yml(ctx, tbl, td, domain, out)
+            written.append(p)
+            print(f"  wrote {p.as_posix()}")
 
-    # 4. classification.json
+    # 4. @transform stubs + update domain.yml imports (Task 7).
+    stub_path, imports = emit.emit_transform_stubs(ctx, decisions, domain, out)
+    written.append(stub_path)
+    print(f"  wrote {stub_path.as_posix()}")
+    domain_yml = out / "config" / domain / "domain.yml"
+    if imports:
+        emit.update_domain_yml_imports(domain_yml, imports)
+        print(f"  updated imports in {domain_yml.as_posix()}")
+
+    # 5. classification.json
     p = emit.emit_classification_json(ctx, decisions, graph, domain, out)
     written.append(p)
     print(f"  wrote {p.as_posix()}")
 
-    # 5. migration_review.md (stub header; full sections in Task 8)
+    # 6. migration_review.md (stub header; full sections in Task 8)
     p = emit.emit_review_md(ctx, decisions, graph, domain, out)
     written.append(p)
     print(f"  wrote {p.as_posix()}")

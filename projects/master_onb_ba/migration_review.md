@@ -5,7 +5,7 @@
 | Workflow | `Master_ONB_BA (1).yxmd` |
 | SHA-256 | `8f35b5c3cea4…` |
 | Domain | `master_onb_ba` |
-| Generated | 2026-10-28 16:02 UTC |
+| Generated | 2026-10-28 16:11 UTC |
 | Tables | 1 |
 | Sources | 1 |
 | Macros missing | GoogleSheetsInput.yxmc |
