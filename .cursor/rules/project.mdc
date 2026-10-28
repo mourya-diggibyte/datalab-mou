@@ -1,0 +1,71 @@
+---
+description: Project context for datalab (Lakeflow Spark Declarative Pipelines medallion framework deployed via a Declarative Automation Bundle + GitHub OIDC CI/CD).
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# datalab — Cursor rules
+
+Full project context — architecture, codebase layout, pipeline authoring
+rules, build/test/deploy commands, common tasks, gotchas, and security — lives
+in [AGENTS.md](../../AGENTS.md). Read it before editing.
+
+Quick pointers:
+
+- **Pipelines are config-driven**: a target table is ONE YAML artifact
+  (`config/<catalog>/<schema>/<table>.yml`; in this repo the example lives at
+  `projects/customer_sales/config/customer_sales/`) — author it with the
+  `author-ldp-artifact` skill; full reference + SDP capability matrix in the
+  framework repo's docs/FRAMEWORK.md. Folder paths mirror the UC namespace
+  (docs/NAMING.md).
+  Never hand-write `dp.*` wiring unless the matrix says the framework can't
+  express it (`author-sdp-pipeline` skill).
+- When SDP code IS written: **`from pyspark import pipelines as dp`** — never
+  `import dlt` (deprecated). Dataset functions return DataFrames; no
+  `.write`, `.saveAsTable`, `.start()`, or `.collect()` inside them. Upserts
+  use AUTO CDC (`target.cdc` in the artifact); data quality uses
+  **databrickslabs/dqx** via the framework — `dp.expect_*` is retired here.
+- The framework is an EXTERNAL dependency (the `datalab-framework` repo),
+  consumed as a git dep + UC-Volume wheel. Domain business logic lives in the
+  domain package (`src/<catalog>_etl/transforms/`, in this repo under
+  `projects/customer_sales/`) as pure, unit-tested `@transform` functions.
+  Parameters come from the pipeline `configuration` mapping via
+  `datalab.config.pipeline_conf` — never hardcode catalogs/schemas/paths.
+- Deploy = **Declarative Automation Bundle**: `databricks.yml` +
+  `projects/*/resources/*.yml` (adopters: `resources/*.yml`), targets `dev`
+  (mode: development) / `stage` / `prod`. `make validate` before pushing
+  bundle changes.
+- **MANDATORY branch-first protocol**: before editing ANY file, verify a
+  work branch is checked out — if on `main`, your FIRST action is
+  `git switch main && git pull && git switch -c <feature|fix|debug>/<slug>`.
+  Never edit, commit, or push while on `main`; one PR per branch; head
+  branches are auto-deleted on merge (AGENTS.md "Branching & releases").
+  Enforced by `.cursor/hooks/branch_guard.py` (file edits + git
+  commit/push-to-main are denied on `main`) and `.githooks/pre-commit`.
+- Dependencies are **uv-only**: `pyproject.toml` + committed `uv.lock`
+  (`make lock` after edits; CI runs `uv sync --frozen`). Never add
+  databricks-connect to this venv — it conflicts with the pyspark dev dep.
+- CI (`.github/workflows/common-ci-steps.yml`) runs ruff + validate-configs +
+  pytest (local Spark) + `bundle validate`; CD deploys via **GitHub OIDC**
+  (no client secret). The OIDC subject must match
+  `repo:<owner>/<repo>:environment:<target>`. See docs/CICD.md.
+<!-- adopter-if:design start -->
+- **The design diagrams are GENERATED - never edit `design/*.drawio`.**
+  `make design` rebuilds them from the estate (`config/`, `resources/*.yml`,
+  `targets/`, `design/estate.yml`) through the vendored
+  drawio-architecture-designer kit; `make design-preview` renders PNGs to look
+  at. Any diagram or architecture update follows the `maintain-design-diagram`
+  skill, and any generator/layout change the `drawio-architecture-designer`
+  skill. `.cursor/hooks/design_drawio_guard.py` blocks direct writes and
+  `make check-design` fails CI on drift or a layout finding.
+<!-- adopter-if:design end -->
+- Production-sensitive files are protected by
+  `.claude/hooks/protected_files_guard.py` and `.githooks/pre-commit`. Keep
+  both + the AGENTS.md "Protected file surface" table in sync when you change
+  the set.
+- **One PR format for everything.** All PRs use
+  `.github/pull_request_template.md`. When opening a PR from the CLI, fill
+  that template into a body file and run `gh pr create --body-file <file>`
+  (or `--web`). A `beforeShellExecution` hook
+  (`.cursor/hooks/pr_template_guard.py`) blocks `gh pr create` that bypasses
+  the template; CI re-checks every PR body.

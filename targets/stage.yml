@@ -1,0 +1,17 @@
+# stage target — production mode, explicit root_path. Per-env variable values.
+targets:
+  stage:
+    mode: production
+    workspace:
+      host: https://dbc-425be768-f138.cloud.databricks.com
+      root_path: /Workspace/Bundles/${bundle.name}/${bundle.target}
+    variables:
+      catalog: customer_sales_stage
+      sales_catalog: sales_stage
+      # Soak-test a NEW framework release on stage before it reaches prod by
+      # overriding the version here (publish it first: `make publish-wheel
+      # TARGET=stage APPLY=1`). Remove the override once prod catches up —
+      # the default in variables/medallion.yml stays the fleet-wide version.
+      # datalab_version: "0.7.0"
+      # Failure alerting for scheduled jobs (empty default = no mail):
+      # alert_emails: [data-platform@your-org.com]

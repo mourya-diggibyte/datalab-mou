@@ -1,0 +1,75 @@
+# Bundle variable declarations + defaults for the datalab medallion domains.
+#
+# This file holds DECLARATIONS (name + description + default) only. Per-target
+# VALUES live in targets/<env>.yml (under targets.<env>.variables); access-
+# control variables live in rbac.yml. Included and deep-merged by databricks.yml.
+#
+# NB: a bundle `variables:` block is global — there is no per-target `variables:`
+# file. Anything that differs by environment is set in targets/ instead.
+variables:
+  catalog:
+    description: Unity Catalog catalog that holds the medallion schemas.
+    default: customer_sales
+  bronze_schema:
+    description: Schema for raw/ingested data.
+    default: bronze
+  silver_schema:
+    description: Schema for cleaned, validated data.
+    default: silver
+  gold_schema:
+    description: Schema for business-level aggregates.
+    default: gold
+  # --- sales domain (projects/sales) — bronze tables pre-exist; SDP owns silver+gold ---
+  sales_catalog:
+    description: Unity Catalog catalog for the `sales` domain medallion.
+    default: sales
+  sales_bronze_schema:
+    description: Schema holding the pre-existing sales bronze tables.
+    default: bronze
+  sales_silver_schema:
+    description: Schema for the sales domain's cleaned/validated tables.
+    default: silver
+  sales_gold_schema:
+    description: Schema for the sales domain's business aggregates.
+    default: gold
+  sales_landing_path:
+    description: UC volume path where raw sales customer JSON files land (Auto Loader source).
+    default: /Volumes/${var.catalog}/landing/sales/customers/
+  sales_export_path:
+    description: UC volume path where gold sales extracts are exported (python-file lane).
+    default: /Volumes/${var.catalog}/exports/sales/
+  # --- lakeflow connect: managed MySQL CDC ingestion (customer_sales) -------
+  # See docs/LAKEFLOW_CONNECT_MYSQL.md. Kept as its own schema (not bronze) so
+  # ingested raw tables + gateway staging/CDC bookkeeping are separated from
+  # the Auto Loader bronze tables and from each other.
+  mysql_raw_schema:
+    description: Schema where Lakeflow Connect lands raw replicated MySQL tables (customer_sales domain).
+    default: mysql_raw
+  mysql_gateway_schema:
+    description: Schema holding the MySQL ingestion gateway's internal CDC bookkeeping/staging (customer_sales domain).
+    default: mysql_gateway_meta
+  # --- framework wheel distribution ----------------------------------------
+  # The datalab FRAMEWORK ships as a versioned wheel built from the pinned git dep
+  # (make publish-wheel) and published into an `artifacts.wheels` UC Volume INSIDE
+  # EACH PROJECT'S OWN CATALOG — customer_sales.artifacts.wheels,
+  # sales.artifacts.wheels — NOT a separate shared catalog. Each domain's
+  # pipelines/jobs install it from THEIR catalog's volume (datalab_wheel /
+  # sales_datalab_wheel below). An adopter with one catalog just gets
+  # `<their_catalog>.artifacts.wheels`. `datalab_version` is the single version
+  # knob (bump in lockstep with the datalab git tag in pyproject.toml, then
+  # re-publish); the versioned filename lets versions coexist on the volume. The
+  # per-domain `<catalog>_etl` wheels are still bundle-built (local).
+  datalab_version:
+    description: Version of the datalab framework wheel installed from each project catalog's artifacts.wheels volume.
+    default: "1.0.0"
+  datalab_wheel:
+    description: UC Volume path of the framework wheel in the customer_sales catalog (var.catalog).
+    default: /Volumes/${var.catalog}/artifacts/wheels/datalab-${var.datalab_version}-py3-none-any.whl
+  sales_datalab_wheel:
+    description: UC Volume path of the framework wheel in the sales catalog (var.sales_catalog).
+    default: /Volumes/${var.sales_catalog}/artifacts/wheels/datalab-${var.datalab_version}-py3-none-any.whl
+  # --- operations ------------------------------------------------------------
+  alert_emails:
+    description: Recipients for scheduled-job failure notifications (empty = no mail; set real addresses per target).
+    type: complex
+    default: []

@@ -1,0 +1,53 @@
+# Lakeflow Spark Declarative Pipeline for the customer_sales domain
+# (bronze→silver→gold). Source code:
+# projects/customer_sales/src/customer_sales_etl/transformations/*.py
+# (pyspark.pipelines). Paths below are relative to THIS file, so the whole
+# projects/customer_sales/ tree can be copied to an adopter repo root (where
+# resources/ sits beside src/) as is.
+
+resources:
+  pipelines:
+    customer_sales_etl:
+      name: customer_sales_etl
+      catalog: ${var.catalog}
+      schema: ${var.silver_schema}
+      serverless: true
+      channel: CURRENT
+      root_path: "../src/customer_sales_etl"
+
+      libraries:
+        - glob:
+            include: ../src/customer_sales_etl/transformations/**
+
+      environment:
+        # Pins the Python runtime independently of DBR upgrades.
+        environment_version: "4"
+        dependencies:
+          # datalab FRAMEWORK wheel — installed from THIS project's own catalog
+          # volume customer_sales.artifacts.wheels (make publish-wheel uploads
+          # datalab-<ver> into each project catalog; CI publishes before deploy).
+          # Bump var.datalab_version to roll it. Serverless does NOT honor an
+          # `--editable` install of synced workspace files, so a wheel is the path.
+          - ${var.datalab_wheel}
+          # This domain's wheel — built by the bundle's customer_sales_etl_wheel
+          # artifact (uv build --package customer_sales_etl). Relative to this file.
+          - ../../../dist/customer_sales_etl-*.whl
+
+      # Surfaced to pipeline code as Spark conf — read via datalab.config.pipeline_conf.
+      configuration:
+        datalab.env: ${bundle.target}
+        datalab.catalog: ${var.catalog}
+        datalab.bronze_schema: ${var.bronze_schema}
+        datalab.silver_schema: ${var.silver_schema}
+        datalab.gold_schema: ${var.gold_schema}
+        datalab.sales_landing_path: ${var.sales_landing_path}
+        # Lakeflow Connect managed MySQL ingestion output schema — declared so
+        # the non-deployed bronze example can be promoted without adding a new
+        # Spark conf later. See docs/LAKEFLOW_CONNECT_MYSQL.md.
+        datalab.mysql_raw_schema: ${var.mysql_raw_schema}
+        # Where the framework finds this domain's layer YAMLs (config-driven
+        # pipeline — see docs/FRAMEWORK.md). Deployed workspace files; in an
+        # adopter repo this would be ${workspace.file_path}/config/<catalog>.
+        datalab.config_dir: ${workspace.file_path}/projects/customer_sales/config/customer_sales
+
+      permissions: ${var.pipeline_permissions}

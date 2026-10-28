@@ -1,0 +1,85 @@
+# datalab — reference domains + deploy bundle (the adopter-shaped repo).
+#
+# The reusable FRAMEWORK lives in its OWN repo (dediggibyte/datalab-framework) and
+# is consumed two ways:
+#   * local dev / CI  → the `datalab` git dependency below, pinned to a release tag
+#     (resolved by uv into the shared venv so test/lint/validate-configs see it);
+#   * Databricks serverless → the versioned wheel from each project catalog's
+#     artifacts.wheels UC Volume (var.datalab_wheel / var.sales_datalab_wheel),
+#     listed in each resource's environment.
+#
+# KEEP IN LOCKSTEP: the `datalab` git tag below and the bundle's var.datalab_version
+# (the Volume wheel) must reference the same framework release.
+#
+# This root is NOT a built package — it is the uv workspace + dev-env definition.
+# The reference domains under projects/ are workspace MEMBERS, each building its own
+# `<catalog>_etl` wheel via the bundle's `artifacts:`.
+
+[project]
+name            = "datalab-projects"
+version         = "0.5.0"
+description     = "datalab reference domains + deploy bundle (consumes the datalab framework as a dependency)."
+requires-python = ">=3.12,<3.14"
+dependencies    = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "ruff>=0.14",
+    # Local Spark for the example tests + the OSS local-run profile. Never add
+    # databricks-connect here (conflicts with pyspark; use `make validate-connect`).
+    # Capped: the OSS SDP subset moves between minors (4.2.0 added an abstract
+    # method to GraphElementRegistry and an SCD1-only create_auto_cdc_flow).
+    # Needs datalab >= 0.8.2 for 4.2. Raise deliberately, after running tests.
+    "pyspark[pipelines]>=4.1.0,<4.3",
+    "pandas>=2.0",
+    # The framework, pinned to a release tag (source mapped to git below). Keep the
+    # tag in lockstep with var.datalab_version (the UC-Volume wheel serverless uses).
+    "datalab",
+    # Reference domains — uv-workspace members, installed editable so the local
+    # test/lint/validate-configs gates exercise them (built as separate wheels by
+    # the bundle, not here).
+    "customer_sales_etl",
+    "sales_etl",
+]
+
+[tool.pytest.ini_options]
+# Framework unit tests live in the datalab-framework repo; here we run each
+# reference domain's own tests (transforms + end-to-end contract) and the
+# repo-integrity scripts' tests (scripts/tests — stdlib, no Spark).
+testpaths = ["projects", "scripts/tests"]
+addopts   = "-ra --tb=short"
+
+[tool.ruff]
+line-length    = 100
+target-version = "py312"
+# Vendored verbatim from the drawio-architecture-designer skill (the diagram
+# kit scripts/design_diagram.py builds on) - kept byte-close to its upstream.
+extend-exclude = ["scripts/drawio_kit"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]   # line length — handled by line-length above
+
+[tool.ruff.lint.isort]
+known-first-party = ["datalab", "customer_sales_etl", "sales_etl"]
+
+[tool.ruff.lint.per-file-ignores]
+# `spark` is injected by the SDP runtime in the pipeline entrypoint; notebooks
+# additionally get ambient dbutils/display (F821) + cell imports (E402).
+"projects/*/src/*/transformations/**" = ["F821"]
+"projects/*/notebooks/**" = ["F821", "E402"]
+
+[tool.uv]
+managed = true
+package = false   # workspace + dev-env root, not a built package
+
+# uv workspace: each reference domain under projects/ is a member building a
+# separate `<catalog>_etl` wheel; `datalab` comes from the framework repo (git).
+[tool.uv.workspace]
+members = ["projects/customer_sales", "projects/sales"]
+
+[tool.uv.sources]
+datalab = { git = "https://github.com/dediggibyte/datalab-framework.git", tag = "v1.0.0" }
+customer_sales_etl = { workspace = true }
+sales_etl = { workspace = true }

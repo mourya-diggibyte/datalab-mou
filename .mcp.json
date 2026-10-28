@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "databricks-sql": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "uc-mcp-proxy",
+        "--url",
+        "/api/2.0/mcp/sql",
+        "--auth-type",
+        "databricks-cli",
+        "--profile",
+        "${DATABRICKS_CONFIG_PROFILE:-diggi_dev_aws}",
+        "--meta",
+        "warehouse_id=${DATABRICKS_SQL_WAREHOUSE_ID:-c1cdbe2406e5cf04}"
+      ]
+    }
+  }
+}

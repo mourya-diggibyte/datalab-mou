@@ -1,0 +1,77 @@
+# Declarative Automation Bundle (formerly Databricks Asset Bundle) for datalab.
+# Docs: https://docs.databricks.com/aws/en/dev-tools/bundles/settings
+#
+# This manifest stays intentionally thin — bundle name + includes only.
+# Everything that varies is externalized and deep-merged in via include:
+#   variables/*.yml   variable declarations + defaults (medallion catalog/schemas/paths)
+#   targets/*.yml     one file per environment (dev/stage/prod): mode, host, per-env values
+#   rbac.yml          access-control variables + per-target permission overrides
+#   resources/*.yml + projects/*/resources/*.yml   pipelines & jobs
+#
+# One-time prerequisite per target (catalog, schemas, volumes, UC grants —
+# kept out of the bundle lifecycle so `bundle destroy` never touches
+# governance state):  make bootstrap-uc TARGET=<dev|stage|prod>
+#
+# Validate / deploy / run:
+#   make validate     databricks bundle validate -t dev
+#   make deploy       databricks bundle deploy   -t dev
+#   make run          databricks bundle run customer_sales_etl -t dev
+
+bundle:
+  name: datalab
+
+# Wheel delivery: the datalab FRAMEWORK no longer ships with the bundle — it is
+# published as a versioned wheel into an `artifacts.wheels` UC Volume inside EACH
+# project's own catalog (`make publish-wheel`; CI publishes before deploy) and
+# installed by that domain's environments from its catalog volume (var.datalab_wheel
+# / var.sales_datalab_wheel). The bundle now builds ONLY the example domain wheels
+# (uv-workspace members); each resource lists its own domain wheel next to the
+# datalab Volume wheel. Serverless still does NOT honor `--editable` installs of
+# synced workspace files, so the example packages must also be built wheels.
+# NB (verify on first dev deploy): each artifact below builds one example wheel
+# into ./dist/; resources reference them by filename glob (customer_sales_etl-*.whl
+# / sales_etl-*.whl). uv must be on PATH for `bundle deploy` (deploy-dab installs it).
+artifacts:
+  customer_sales_etl_wheel:
+    type: whl
+    build: uv build --wheel --package customer_sales_etl
+    path: .
+  sales_etl_wheel:
+    type: whl
+    build: uv build --wheel --package sales_etl
+    path: .
+
+# variables: and targets: deep-merge across includes, so they live in their own
+# files. Declarations (variables/) before per-env values (targets/); rbac.yml
+# contributes both its variables and per-target permission overrides.
+include:
+  - variables/*.yml
+  - targets/*.yml
+  - rbac.yml
+  - resources/*.yml
+  - projects/*/resources/*.yml
+
+# Dev-only surfaces kept OUT of the deployed workspace files. A DAB
+# `bundle deploy` does NOT honor `.databricksignore` (that file is only for
+# `databricks sync` / the IDE extension) — `sync.exclude` is the
+# bundle-effective mechanism. Keep this list aligned with `.databricksignore`.
+# (gitignore-style globs, relative to the bundle root. Never exclude src/,
+# projects/*/{src,config,resources}, variables/, targets/, rbac.yml, pyproject —
+# the deploy + the example pipelines need them.)
+sync:
+  exclude:
+    - tests
+    - projects/*/tests
+    - docs
+    - design
+    - .github
+    - .claude
+    - .cursor
+    - .codex
+    - .agents
+    - .githooks
+    - omnigent
+    - .mcp.json
+    - Makefile
+    - uv.lock
+    - .markdownlint.json

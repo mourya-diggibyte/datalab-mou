@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make help)",
+      "Bash(make lint)",
+      "Bash(make test)",
+      "Bash(make validate-configs)",
+      "Bash(make check-adopter-docs)",
+      "Bash(make check-agent-settings)",
+      "Bash(make check-changelog)",
+      "Bash(make check-domains)",
+      "Bash(make check-lockstep)",
+      "Bash(make check-schemas)",
+      "Bash(make check-skills)",
+      "Bash(make check-sync-lists)",
+      "Bash(make check-templates-doc)",
+      "Bash(make dry-run-local)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.cursor/hooks/branch_guard.py\""
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/protected_files_guard.py\""
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.cursor/hooks/design_drawio_guard.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.cursor/hooks/branch_guard.py\""
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.cursor/hooks/pr_template_guard.py\""
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.cursor/hooks/design_drawio_guard.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

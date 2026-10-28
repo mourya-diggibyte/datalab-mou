@@ -1,0 +1,32 @@
+# Exclusions for `databricks sync` and the Databricks IDE extension.
+#
+# IMPORTANT: `databricks bundle deploy` does NOT read this file — it honors
+# .gitignore plus the `sync.exclude:` block in databricks.yml. Keep this list
+# ALIGNED with that block (it mirrors these paths) so the sync command and the
+# bundle deploy exclude the same dev-only surfaces.
+#
+# The deploy MUST ship: pyproject.toml + src/** + projects/** (the example
+# pipelines' code/config live under projects/; the example domain wheels are
+# built by the databricks.yml `artifacts:`, and the framework wheel is installed
+# from each project catalog's artifacts.wheels UC Volume — see AGENTS.md "Wheel delivery").
+
+# Dev-only surfaces — not needed at runtime
+tests/
+projects/*/tests/
+docs/
+design/
+
+# CI/CD + agent harness
+.github/
+.claude/
+.cursor/
+.codex/
+.agents/
+.githooks/
+omnigent/
+.mcp.json
+
+# Local tooling
+Makefile
+uv.lock
+.markdownlint.json

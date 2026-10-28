@@ -1,0 +1,128 @@
+name: "CD · deploy bundle"
+
+# Reusable workflow. Called by ci-cd-{dev,stage,prod}.yml after CI passes.
+# Authenticates with GitHub OIDC — no long-lived Databricks secret in GitHub.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Bundle target (dev | stage | prod). Avoid the name 'env' here — it shadows GitHub Actions' env: keyword."
+        required: true
+        type: string
+      auto-approve:
+        description: "Pass --auto-approve to `bundle deploy` so destructive changes (e.g. deleting a renamed pipeline) apply non-interactively. Enable only for disposable targets (dev); stage/prod review deletions manually."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      deployed:
+        description: "'true' once `bundle deploy` succeeded; empty when the environment gate skipped the deploy. ci-cd.yml cuts a changelog release only after a real deploy."
+        value: ${{ jobs.deploy.outputs.deployed }}
+
+permissions:
+  id-token: write    # OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: "Deploy to ${{ inputs.target }}"
+    runs-on: ubuntu-latest
+    # Serialize deploys per target: concurrent pushes queue instead of
+    # interleaving `bundle deploy` state updates. Never cancel a running
+    # deploy — a killed deploy can leave the bundle half-applied.
+    concurrency:
+      group: cd-${{ inputs.target }}
+      cancel-in-progress: false
+    # Resolves `secrets.*` against the GitHub Environment whose name matches
+    # the target (dev / stage / prod). The OIDC federation policy subject must
+    # match `repo:<owner>/<repo>:environment:<target>` — see docs/CICD.md.
+    environment: ${{ inputs.target }}
+    outputs:
+      deployed: ${{ steps.deployed.outputs.deployed }}
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST:      ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    steps:
+      # Skip (gracefully, keeping the merge green) when the target's GitHub
+      # Environment has no Databricks secrets yet — e.g. stage/prod before
+      # their workspaces/SPs are provisioned.
+      - name: Gate on environment provisioning
+        id: gate
+        run: |
+          if [ -z "$DATABRICKS_HOST" ] || [ -z "$DATABRICKS_CLIENT_ID" ]; then
+            echo "::notice::GitHub Environment '${{ inputs.target }}' has no DATABRICKS_HOST/DATABRICKS_CLIENT_ID secrets — skipping deploy."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.gate.outputs.enabled == 'true'
+
+      - name: Check framework App credentials are configured
+        # The deploy clones the PRIVATE datalab-framework repo: the deploy-dab
+        # publish step builds the framework wheel from the pinned git dep
+        # (shallow clone + `uv build`) and `bundle deploy` resolves it too. Same
+        # datalab-framework reader GitHub App CI uses — see docs/CICD.md.
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          CLIENT_ID: ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          APP_KEY:   ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error title=Missing framework App credentials::The deploy must mint a token from the datalab-framework reader GitHub App to clone the PRIVATE dediggibyte/datalab-framework repo, but the DATALAB_FRAMEWORK_APP_CLIENT_ID variable and/or DATALAB_FRAMEWORK_APP_PRIVATE_KEY secret is not set. See docs/CICD.md."
+            exit 1
+          fi
+
+      - name: Mint a read-only token for datalab-framework (GitHub App)
+        # Short-lived installation token (~1h, auto-revoked in a post step),
+        # scoped to just dediggibyte/datalab-framework (Contents: read-only).
+        if: steps.gate.outputs.enabled == 'true'
+        id: framework_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:    ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          private-key:  ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+          owner:        dediggibyte
+          repositories: datalab-framework
+
+      - name: Route the private framework clone over HTTPS with the token
+        # Both the publish step (clone of `git+https://…`) and
+        # `bundle deploy` resolve the framework git dep through this rewrite.
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          FRAMEWORK_TOKEN: ${{ steps.framework_token.outputs.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${FRAMEWORK_TOKEN}@github.com/dediggibyte/datalab-framework".insteadOf \
+            "https://github.com/dediggibyte/datalab-framework"
+
+      - name: Configure Databricks CLI (OIDC)
+        if: steps.gate.outputs.enabled == 'true'
+        uses: ./.github/actions/databricks-setup
+        with:
+          databricks-host:      ${{ secrets.DATABRICKS_HOST }}
+          databricks-client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+
+      - name: Deploy bundle
+        if: steps.gate.outputs.enabled == 'true'
+        uses: ./.github/actions/deploy-dab
+        with:
+          target: ${{ inputs.target }}
+          auto-approve: ${{ inputs.auto-approve }}
+          # Optional per-environment overrides; empty → databricks.yml defaults.
+          catalog:            ${{ vars.DATALAB_CATALOG || '' }}
+          sales-catalog:      ${{ vars.DATALAB_SALES_CATALOG || '' }}
+          sales-landing-path: ${{ vars.DATALAB_SALES_LANDING_PATH || '' }}
+          reader-group:       ${{ vars.DATALAB_READER_GROUP || '' }}
+          engineer-group:     ${{ vars.DATALAB_ENGINEER_GROUP || '' }}
+          admin-group:        ${{ vars.DATALAB_ADMIN_GROUP || '' }}
+
+      - name: Record that the bundle was deployed
+        # Reached only when every step above succeeded. ci-cd.yml's `release` job
+        # keys on this: a deploy that ran is what turns [Unreleased] into a release.
+        id: deployed
+        if: steps.gate.outputs.enabled == 'true'
+        run: echo "deployed=true" >> "$GITHUB_OUTPUT"

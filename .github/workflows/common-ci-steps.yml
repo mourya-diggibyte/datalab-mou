@@ -1,0 +1,485 @@
+name: "CI · lint + test + validate"
+
+# Reusable workflow. Called by ci-cd-{dev,stage,prod}.yml.
+# Lint + unit tests run against a local Spark — no workspace, no secrets.
+# Bundle validation authenticates via GitHub OIDC.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Bundle target (dev | stage | prod). Avoid the name 'env' here — it shadows GitHub Actions' env: keyword."
+        required: true
+        type: string
+
+permissions:
+  id-token: write    # required for OIDC auth on the validate-bundle job
+  contents: read
+
+jobs:
+  test:
+    name: "lint + unit test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Exact pin: setup-uv publishes no floating major tag (only vX.Y.Z).
+        # Dependabot's `actions` group opens bump PRs on new releases.
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Java (local Spark for unit tests)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Check framework App credentials are configured
+        # uv resolves `datalab` from the PRIVATE dediggibyte/datalab-framework repo.
+        # We authenticate with a short-lived token minted from the datalab-framework
+        # reader GitHub App (client id + private key) — no SSH deploy key, no PAT to
+        # rotate. Fail fast with an actionable message before the token step. See
+        # docs/CICD.md.
+        env:
+          CLIENT_ID: ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          APP_KEY:   ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error title=Missing framework App credentials::CI must mint a token from the datalab-framework reader GitHub App to clone the PRIVATE dediggibyte/datalab-framework repo, but the DATALAB_FRAMEWORK_APP_CLIENT_ID variable and/or DATALAB_FRAMEWORK_APP_PRIVATE_KEY secret is not set. See docs/CICD.md."
+            exit 1
+          fi
+
+      - name: Mint a read-only token for datalab-framework (GitHub App)
+        # Short-lived installation token (~1h, auto-revoked in a post step),
+        # scoped to just dediggibyte/datalab-framework. The App is installed on
+        # that repo with Contents: read-only.
+        id: framework_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:    ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          private-key:  ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+          owner:        dediggibyte
+          repositories: datalab-framework
+
+      - name: Route the private framework clone over HTTPS with the token
+        # uv's git clone of `datalab @ git+https://…/datalab-framework` picks up
+        # this rewrite; the token replaces the SSH deploy key.
+        env:
+          FRAMEWORK_TOKEN: ${{ steps.framework_token.outputs.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${FRAMEWORK_TOKEN}@github.com/dediggibyte/datalab-framework".insteadOf \
+            "https://github.com/dediggibyte/datalab-framework"
+
+      - name: Sync dependencies (frozen — fails fast if uv.lock drifted)
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        # Same paths as `make lint` — the framework moved to the datalab-framework
+        # repo; here we lint scripts/ + the reference domains under projects/.
+        run: uv run ruff check scripts projects
+
+      # Optional gates are fenced `# adopter-if:<feature>`: the adopter scaffold
+      # keeps a step only when the generated repo has what it checks.
+      # adopter-if:agent-claude start
+      - name: Check agent-skill mirror is in sync (no drift from .agents/skills)
+        # Mirror of `make check-skills`. Skills are authored once under
+        # .agents/skills/ (read natively by Cursor + Codex); .claude/skills is a
+        # generated copy for Claude Code (scripts/sync_skills.py). Fails on drift.
+        run: uv run python scripts/sync_skills.py --check
+      # adopter-if:agent-claude end
+
+      # adopter-if:hooked-agent start
+      - name: Check committed agent configs are machine-independent
+        # Mirror of `make check-agent-settings`. Claude Code appends "always
+        # allow" grants to a settings file, and a run of them landed in the
+        # TRACKED .claude/settings.json — including an absolute path into a dead
+        # session's scratch directory. That file is shared with every developer
+        # and copied into every adopter repo, so such a grant is inert for them
+        # and leaks the author's local paths. Per-developer grants belong in the
+        # gitignored .claude/settings.local.json.
+        run: uv run --no-project python scripts/check_agent_settings.py
+      # adopter-if:hooked-agent end
+
+      # adopter-if:template start
+      - name: Check the adopter templates doc matches the scaffold engine
+        # Mirror of `make check-templates-doc`: the bootstrap-adopter-repo skill's
+        # references/templates.md is the documented MANUAL FALLBACK, so every
+        # code block in it must equal what scaffold_adopter.py writes. It had
+        # drifted into shipping an uncommented environment_version (which bricks
+        # a new pipeline behind Databricks' fingerprint gate) and an
+        # empty-layer-dir instruction the config validator rejects.
+        run: uv run --no-project python scripts/check_templates_doc.py
+      # adopter-if:template end
+
+      - name: Check framework version pin is in lockstep
+        # Mirror of `make check-lockstep`: the datalab git tag (pyproject.toml
+        # [tool.uv.sources]), var.datalab_version (variables/medallion.yml — the
+        # Volume wheel filename) and the uv.lock resolution must all reference the
+        # same framework release. Historically prose-enforced and it drifted.
+        run: uv run --no-project python scripts/check_lockstep.py
+
+      - name: Check CHANGELOG.md is releasable (structure + repo version lockstep)
+        # Mirror of `make check-changelog`. After every deploy of main, ci-cd.yml's
+        # `release` job cuts [Unreleased] into a version; this keeps the file in a
+        # shape that cut can parse, and pyproject.toml + uv.lock on the version of
+        # the newest release (it moves only when a deploy cuts one).
+        run: uv run --no-project python scripts/release_changelog.py check
+
+      # adopter-if:schemas start
+      - name: Check vendored schemas match the pinned framework (no drift)
+        # Mirror of `make check-schemas`: schemas/*.json are GENERATED from the
+        # pinned framework's Pydantic models (scripts/sync_schemas.py); hand-copied
+        # vendoring went stale two releases in a row before this check existed.
+        run: uv run python scripts/sync_schemas.py --check
+      # adopter-if:schemas end
+
+      # adopter-if:design start
+      - name: Check the design package is current and cleanly laid out
+        # Mirror of `make check-design`: design/PIPELINES.md is RENDERED from the
+        # config/ artifacts (scripts/design_inventory.py), and design/*.drawio are
+        # GENERATED from the estate through the drawio-architecture-designer kit
+        # (scripts/design_diagram.py). A table added without `make design` leaves
+        # the design describing a pipeline that no longer exists; a hand-edited
+        # .drawio drifts from the generator; a layout finding (clipped text, an
+        # arrow through a card) fails here instead of in a client review.
+        run: |
+          uv run python scripts/design_inventory.py --check
+          uv run python scripts/design_diagram.py --check
+      # adopter-if:design end
+
+      - name: Check the domain registry resolves against the bundle files
+        # Mirror of `make check-domains`: scripts/domains.py must resolve every
+        # target's domain catalogs + persona groups from variables/ + targets/ +
+        # rbac.yml (bootstrap_uc and publish_wheel depend on this resolution).
+        run: uv run python scripts/domains.py
+
+      - name: Check sync.exclude and .databricksignore are aligned
+        # Mirror of `make check-sync-lists`: `bundle deploy` honors only
+        # databricks.yml sync.exclude; `databricks sync`/the IDE extension honor
+        # only .databricksignore. Divergence silently deploys (or drops) files.
+        run: uv run python scripts/check_sync_lists.py
+
+      - name: Validate dataset configs (pydantic + static dqx checks)
+        # Same loader as `make validate-configs`, the pipeline import, and the
+        # editor schemas: a bad artifact fails CI before any deploy. Mirrors
+        # the Makefile's CONFIG_DIRS (root config/ for adopters, projects/*/config here).
+        run: |
+          dirs=()
+          for d in config projects/*/config; do [ -d "$d" ] && dirs+=("$d"); done
+          uv run python -m datalab.framework "${dirs[@]}"
+
+      - name: Unit tests (local Spark)
+        run: uv run pytest
+
+      # adopter-if:schemas&any-agent start
+      - name: Authoring skill documents every kind of the pinned framework
+        # Mirror of `make check-framework-surface`: a framework release that adds
+        # a target/source kind needs that kind documented in the author-ldp-artifact
+        # skill — the corresponding change a bump must carry (the skill never
+        # learned foreach_batch_sink until this gate existed). Last among the
+        # blocking steps, so a gap never hides lint/test results. Enforced in the
+        # template; a warning in generated adopters (DATALAB_FRAMEWORK_MANDATE).
+        # Reads schemas/ + the .agents skill, so it ships only with both.
+        env:
+          DATALAB_FRAMEWORK_MANDATE: ${{ vars.DATALAB_FRAMEWORK_MANDATE }}
+        run: python3 scripts/check_framework_surface.py
+      # adopter-if:schemas&any-agent end
+
+      # adopter-if:local-dev start
+      - name: Local SDP graph dry-run (OSS spark-pipelines)
+        # Guards the local-run profile (datalab.framework.local): generates the
+        # spark-pipeline.yml and runs `spark-pipelines dry-run` (syntax/analysis/
+        # graph validation, no data) on the same Java as the unit tests. Advisory
+        # (continue-on-error) — the blocking regression guard is the capture test
+        # in tests/unit/framework/test_local.py; this exercises the OSS CLI end to
+        # end while the SDP + dqx + Spark Connect path stabilizes upstream.
+        run: make dry-run-local
+        continue-on-error: true
+      # adopter-if:local-dev end
+
+  framework-current:
+    name: "framework pin is the latest release"
+    # Mirror of `make check-framework-current`, as its OWN job so a stale pin
+    # never hides lint/test results. In the TEMPLATE, adopting every
+    # datalab-framework release is MANDATORY: while a newer release exists this
+    # fails every PR and main (deploys wait on `ci`) until the framework-bump
+    # bot's PR merges. Generated adopter repos only warn unless they set the
+    # DATALAB_FRAMEWORK_MANDATE variable to `enforce`; in the template, `warn`
+    # is the incident break-glass. See docs/CICD.md "Framework bumps".
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check framework App credentials are configured
+        env:
+          CLIENT_ID: ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          APP_KEY:   ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error title=Missing framework App credentials::Reading the PRIVATE dediggibyte/datalab-framework releases needs the datalab-framework reader GitHub App, but the DATALAB_FRAMEWORK_APP_CLIENT_ID variable and/or DATALAB_FRAMEWORK_APP_PRIVATE_KEY secret is not set. See docs/CICD.md."
+            exit 1
+          fi
+
+      - name: Mint a read-only token for datalab-framework (GitHub App)
+        id: framework_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:    ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          private-key:  ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+          owner:        dediggibyte
+          repositories: datalab-framework
+
+      - name: Route the private framework clone over HTTPS with the token
+        # Only for the script's git-tags fallback (GitHub Releases are read with gh).
+        env:
+          FRAMEWORK_TOKEN: ${{ steps.framework_token.outputs.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${FRAMEWORK_TOKEN}@github.com/dediggibyte/datalab-framework".insteadOf \
+            "https://github.com/dediggibyte/datalab-framework"
+
+      - name: Framework pin is the latest published release
+        env:
+          GH_TOKEN: ${{ steps.framework_token.outputs.token }}
+          DATALAB_FRAMEWORK_MANDATE: ${{ vars.DATALAB_FRAMEWORK_MANDATE }}
+        run: python3 scripts/check_framework_current.py
+
+  validate-bundle:
+    name: "bundle validate (${{ inputs.target }})"
+    needs: test
+    runs-on: ubuntu-latest
+    # Resolves secrets.* against the GitHub Environment matching the target.
+    environment: ${{ inputs.target }}
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST:      ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    steps:
+      # Same graceful gate as the CD workflow: an unprovisioned GitHub
+      # Environment (no Databricks secrets yet — e.g. stage/prod before their
+      # SPs exist) skips validation instead of failing the run. docs/CICD.md
+      # promises this behavior for both CI and CD.
+      - name: Gate on environment provisioning
+        id: gate
+        run: |
+          if [ -z "$DATABRICKS_HOST" ] || [ -z "$DATABRICKS_CLIENT_ID" ]; then
+            echo "::notice::GitHub Environment '${{ inputs.target }}' has no DATABRICKS_HOST/DATABRICKS_CLIENT_ID secrets — skipping bundle validate."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.gate.outputs.enabled == 'true'
+
+      - name: Configure Databricks CLI (OIDC)
+        if: steps.gate.outputs.enabled == 'true'
+        uses: ./.github/actions/databricks-setup
+        with:
+          databricks-host:      ${{ secrets.DATABRICKS_HOST }}
+          databricks-client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+
+      - name: databricks bundle validate -t ${{ inputs.target }}
+        if: steps.gate.outputs.enabled == 'true'
+        run: databricks bundle validate -t ${{ inputs.target }}
+
+  # --- template-only below: stripped from generated adopters by scaffold_adopter.py ---
+  # The adopter scaffold is the headline "stand up a customer repo" feature and
+  # performs a substantial transformation (drops projects/, hoists one domain to
+  # the root, rewrites ~15 repo-level files). This smoke test runs it end to end
+  # and then runs the GENERATED repo's own quality gates, so a scaffold or
+  # template regression fails the PR instead of the next customer bootstrap.
+  scaffold-smoke:
+    name: "adopter scaffold smoke test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Java (local Spark for the generated repo's tests)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Check framework App credentials are configured
+        # Same fail-fast as the `test` job (see above). Without it this job dies
+        # inside create-github-app-token with a bare "private-key input must be
+        # set" — on a job whose name gives no hint it needs framework credentials,
+        # so one missing secret produces two unrelated-looking failures on the
+        # same run and triage goes to the scaffold generator instead.
+        env:
+          CLIENT_ID: ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          APP_KEY:   ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error title=Missing framework App credentials::The adopter scaffold smoke test must mint a token from the datalab-framework reader GitHub App to resolve the PRIVATE dediggibyte/datalab-framework git dep in the GENERATED repo, but the DATALAB_FRAMEWORK_APP_CLIENT_ID variable and/or DATALAB_FRAMEWORK_APP_PRIVATE_KEY secret is not set (repo or org scope — NOT environment). See docs/CICD.md."
+            exit 1
+          fi
+
+      - name: Mint a read-only token for datalab-framework (GitHub App)
+        # The generated repo resolves the same private framework git dep.
+        id: framework_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:    ${{ vars.DATALAB_FRAMEWORK_APP_CLIENT_ID }}
+          private-key:  ${{ secrets.DATALAB_FRAMEWORK_APP_PRIVATE_KEY }}
+          owner:        dediggibyte
+          repositories: datalab-framework
+
+      - name: Route the private framework clone over HTTPS with the token
+        env:
+          FRAMEWORK_TOKEN: ${{ steps.framework_token.outputs.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${FRAMEWORK_TOKEN}@github.com/dediggibyte/datalab-framework".insteadOf \
+            "https://github.com/dediggibyte/datalab-framework"
+
+      # Adopters choose their coding agents and components, so one profile proves
+      # nothing about the others. Three are built here: FULL (every agent +
+      # component, incl. the generated design package), MINIMAL (none — converted
+      # in place, the path customers take) and MIXED (claude + genie, docs + mcp:
+      # a partial harness). Each is also checked FROM the template by
+      # `make check-adopter-docs ADOPTER=…` for template identity and dangling
+      # references to anything the profile dropped.
+      - name: Generate the FULL adopter (make new-adopter — every agent + component)
+        run: |
+          uv sync --frozen
+          make new-adopter CATALOG=acme OUT="$RUNNER_TEMP/acme-datalab" \
+            CUSTOMER="Acme Corp" REPO=acme-corp/acme-datalab \
+            HOST=https://adb-000000000000000.0.azuredatabricks.net \
+            HOST_PROD=https://adb-111111111111111.1.azuredatabricks.net \
+            WAREHOUSE_ID=0000000000000000 DEPLOY_SP=00000000-0000-0000-0000-000000000000 \
+            AGENTS=all COMPONENTS=all
+          make check-adopter-docs ADOPTER="$RUNNER_TEMP/acme-datalab"
+
+      - name: Run the FULL adopter's quality gates
+        working-directory: ${{ runner.temp }}/acme-datalab
+        run: |
+          make validate-configs
+          make lint
+          make test
+          make check-schemas
+          make check-lockstep
+          # The scaffold's CHANGELOG.md must be one the deploy-time release cut
+          # (scripts/release_changelog.py) can parse, on the pyproject version.
+          make check-changelog
+          make check-framework-surface
+          make check-domains
+          make check-sync-lists
+          # The skills mirror is regenerated from the pruned, patched canonical
+          # copy — an adopter whose first `make check-skills` fails ships broken.
+          make check-skills
+          # The tracked agent configs are regenerated per adopter (read-only make
+          # grants, hooks only for scripts it has) — the check proves both.
+          make check-agent-settings
+          # design/PIPELINES.md is pre-rendered by the scaffold; the adopter's own
+          # renderer must agree with it from day one.
+          make check-design
+
+      - name: Local SDP graph dry-run in the generated repo (OSS spark-pipelines)
+        # The scaffold rewrites LOCAL_DOMAIN_CONFIG / LOCAL_TRANSFORMS /
+        # LOCAL_LANDING and the spec-local conf flag. Nothing asserted they still
+        # resolve, so `make run-local` — the first thing a new adopter runs to
+        # see their pipeline work — could break silently.
+        working-directory: ${{ runner.temp }}/acme-datalab
+        run: make dry-run-local
+
+      - name: Assert adopter invariants (landing-volume contract, AGENTS.md conversion)
+        working-directory: ${{ runner.temp }}/acme-datalab
+        run: |
+          set -euo pipefail
+          # 1. The landing volume bootstrap creates must be the one landing_path reads
+          #    (the volume segment of /Volumes/<catalog>/landing/<VOLUME>/...).
+          uv run python scripts/bootstrap_uc.py --target dev | grep -F 'CREATE VOLUME IF NOT EXISTS `acme`.`landing`.`acme`' \
+            || { echo "::error::bootstrap_uc does not create the volume var.landing_path points at (landing.acme)"; exit 1; }
+          grep -F '/Volumes/${var.catalog}/landing/acme/events/' variables/medallion.yml \
+            || { echo "::error::var.landing_path does not follow the landing/<catalog>/ contract"; exit 1; }
+          # 2. AGENTS.md (auto-loaded by CLAUDE.md) and the operational surfaces
+          #    must describe the ADOPTER repo — no reference to the deleted
+          #    projects/ + omnigent/ material except lines explicitly naming the
+          #    template repo. (design/ is legitimately present in this profile;
+          #    check-adopter-docs covers it for the profiles without it.)
+          if grep -n "projects/\|omnigent" AGENTS.md Makefile databricks.yml .databricksignore | grep -v "template repo"; then
+            echo "::error::template-only references survived the conversion"; exit 1
+          fi
+          # 3. Deployed surfaces carry no template identity.
+          if grep -rn "customer_sales\|diggi_dev_aws\|c1cdbe2406e5cf04" config src resources variables targets rbac.yml databricks.yml pyproject.toml README.md; then
+            echo "::error::template identity leaked into a deployed surface"; exit 1
+          fi
+          # 4. The starter sample data, the customer's own design package, the
+          #    per-target hosts, the recorded answers — and no template tooling.
+          test -f sample_data/landing/acme/events/events.json
+          test -f design/OVERVIEW.md && test -f design/PIPELINES.md
+          grep -F 'adb-111111111111111' targets/prod.yml >/dev/null \
+            || { echo "::error::the prod host did not reach targets/prod.yml"; exit 1; }
+          python3 -c 'import json; a=json.load(open(".datalab-adopter.json"))["answers"]; assert a["catalog"]=="acme" and len(a["agents"])==4, a'
+          for gone in scripts/scaffold_adopter.py scripts/check_adopter_docs.py \
+                      scripts/check_templates_doc.py scripts/tests .agents/skills/bootstrap-adopter-repo; do
+            if [ -e "$gone" ]; then echo "::error::template-only $gone shipped to the adopter"; exit 1; fi
+          done
+
+      # The documented FIRST command a new adopter runs is `make configure-adopter`
+      # (convert a GitHub-template clone IN PLACE) — docs/NEW_ADOPTER.md step 2.
+      # It differs materially from new-adopter: it deletes from a real clone
+      # instead of copying tracked files, and it resolves the repo slug from git
+      # origin to rewrite docs/CICD.md's OIDC subject. Built here as the MINIMAL
+      # profile: no coding agents, no optional components.
+      - name: Convert a clone IN PLACE — MINIMAL (make configure-adopter, nothing optional)
+        run: |
+          set -euo pipefail
+          git clone --no-hardlinks . "$RUNNER_TEMP/beta-datalab"
+          cd "$RUNNER_TEMP/beta-datalab"
+          # The engine refuses to convert the canonical template in place; this
+          # clone's origin is a local path, so the guard correctly lets it run.
+          make configure-adopter YES=1 CATALOG=beta \
+            HOST=https://adb-000000000000000.0.azuredatabricks.net \
+            WAREHOUSE_ID=0000000000000000 DEPLOY_SP=00000000-0000-0000-0000-000000000000 \
+            AGENTS=none COMPONENTS=none
+          test -d config/beta && test -f resources/beta_etl.pipeline.yml
+          test ! -d projects && test ! -d design && test ! -d omnigent
+          for gone in .agents .claude .cursor .codex CLAUDE.md .mcp.json docs schemas \
+                      sample_data .githooks .gitattributes .github/dependabot.yml \
+                      .github/pull_request_template.md .github/workflows/framework-bump.yml \
+                      .github/workflows/pr-template-check.yml scripts/sync_skills.py \
+                      scripts/validate_connect.py scripts/check_framework_surface.py \
+                      scripts/scaffold_adopter.py scripts/tests; do
+            if [ -e "$gone" ]; then echo "::error::$gone survived a no-agent, no-component profile"; exit 1; fi
+          done
+          # Re-running the configurator inside the adopter must be impossible and
+          # write NOTHING — it used to overwrite pyproject/databricks.yml/targets
+          # and add a second domain before crashing on the first missing anchor.
+          # The scaffold tooling no longer ships (and the engine refuses a repo
+          # without projects/ even where an old copy of it survives).
+          before=$(git status --porcelain | sha1sum)
+          if make configure-adopter YES=1 CATALOG=other 2>/dev/null; then
+            echo "::error::configure-adopter ran inside an already-generated adopter"; exit 1
+          fi
+          [ "$before" = "$(git status --porcelain | sha1sum)" ] \
+            || { echo "::error::a refused re-run still changed the repo"; exit 1; }
+          make lock
+          make validate-configs lint test check-lockstep check-changelog check-domains check-sync-lists
+
+      - name: Check the MINIMAL adopter from the template (dangling references)
+        run: make check-adopter-docs ADOPTER="$RUNNER_TEMP/beta-datalab"
+
+      - name: Generate + check a MIXED adopter (claude + genie · docs + mcp)
+        run: |
+          set -euo pipefail
+          make new-adopter CATALOG=gamma OUT="$RUNNER_TEMP/gamma-datalab" \
+            AGENTS=claude,genie COMPONENTS=docs,mcp
+          make check-adopter-docs ADOPTER="$RUNNER_TEMP/gamma-datalab"
+          cd "$RUNNER_TEMP/gamma-datalab"
+          test -f .claude/settings.json && test -f .mcp.json && test ! -d .cursor/rules
+          test -f scripts/publish_genie_skills.py && test ! -e .codex
+          make lock
+          make lint validate-configs check-skills check-agent-settings check-sync-lists check-changelog

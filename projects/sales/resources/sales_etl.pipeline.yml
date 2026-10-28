@@ -1,0 +1,50 @@
+# Lakeflow Spark Declarative Pipeline for the sales domain (bronze→silver→gold).
+# Source code: projects/sales/src/sales_etl/transformations/*.py
+# (pyspark.pipelines). Paths below are relative to THIS file, so the whole
+# projects/sales/ tree can be copied to an adopter repo root (where resources/
+# sits beside src/) as is.
+#
+# The five bronze tables (sales.bronze.*) are ingested upstream; this pipeline
+# reads them and owns only the silver + gold layers.
+
+resources:
+  pipelines:
+    sales_etl:
+      name: sales_etl
+      catalog: ${var.sales_catalog}
+      schema: ${var.sales_silver_schema}
+      serverless: true
+      channel: CURRENT
+      root_path: "../src/sales_etl"
+
+      libraries:
+        - glob:
+            include: ../src/sales_etl/transformations/**
+
+      environment:
+        # Pins the Python runtime independently of DBR upgrades.
+        environment_version: "4"
+        dependencies:
+          # datalab FRAMEWORK wheel — installed from THIS project's own catalog
+          # volume sales.artifacts.wheels (make publish-wheel uploads datalab-<ver>
+          # into each project catalog; CI publishes before deploy). Bump
+          # var.datalab_version to roll it. Serverless does NOT honor an
+          # `--editable` install of synced workspace files, so a wheel is the path.
+          - ${var.sales_datalab_wheel}
+          # This domain's wheel — built by the bundle's sales_etl_wheel artifact
+          # (uv build --package sales_etl). Relative to this resource file.
+          - ../../../dist/sales_etl-*.whl
+
+      # Surfaced to pipeline code as Spark conf — read via datalab.config.pipeline_conf.
+      configuration:
+        datalab.env: ${bundle.target}
+        datalab.catalog: ${var.sales_catalog}
+        datalab.bronze_schema: ${var.sales_bronze_schema}
+        datalab.silver_schema: ${var.sales_silver_schema}
+        datalab.gold_schema: ${var.sales_gold_schema}
+        # Where the framework finds this domain's layer YAMLs (config-driven
+        # pipeline — see docs/FRAMEWORK.md). Deployed workspace files; in an
+        # adopter repo this would be ${workspace.file_path}/config/<catalog>.
+        datalab.config_dir: ${workspace.file_path}/projects/sales/config/sales
+
+      permissions: ${var.pipeline_permissions}

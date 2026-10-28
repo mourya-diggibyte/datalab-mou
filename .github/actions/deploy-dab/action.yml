@@ -1,0 +1,132 @@
+name: "Deploy Declarative Automation Bundle"
+description: "Validate + deploy the datalab bundle to the given target."
+
+inputs:
+  target:
+    description: "Bundle target (dev | stage | prod). Avoid the name 'env' here — it shadows GitHub Actions' env: keyword."
+    required: true
+  profile:
+    description: "Databricks CLI profile."
+    required: false
+    default: "DEFAULT"
+  auto-approve:
+    description: >-
+      Pass --auto-approve to `bundle deploy` so a non-interactive CI console can
+      apply DESTRUCTIVE changes (e.g. deleting a renamed/removed pipeline and its
+      streaming tables / materialized views). Enable only for disposable targets
+      (dev, mode: development — a full refresh restores all STs/MVs). Leave
+      "false" for stage/prod so pipeline/table/volume deletions are reviewed by a
+      human before they run.
+    required: false
+    default: "false"
+
+  # Per-target overrides. Empty defaults mean 'use whatever the bundle
+  # (databricks.yml + rbac.yml) says'. Only string variables can be overridden
+  # with --var (complex variables like pipeline_permissions cannot) — which is
+  # why the permission GROUP NAMES are plain string variables in rbac.yml that
+  # the complex defaults reference.
+  catalog:
+    description: "Unity Catalog catalog override for the customer_sales domain (overrides var.catalog)."
+    required: false
+    default: ""
+  sales-catalog:
+    description: "Unity Catalog catalog override for the sales domain (overrides var.sales_catalog)."
+    required: false
+    default: ""
+  sales-landing-path:
+    description: "Override for the Auto Loader landing volume path."
+    required: false
+    default: ""
+  reader-group:
+    description: "Workspace group granted read/run access (overrides var.reader_group)."
+    required: false
+    default: ""
+  engineer-group:
+    description: "Workspace group granted manage access (overrides var.engineer_group)."
+    required: false
+    default: ""
+  admin-group:
+    description: "Workspace group granted admin access (overrides var.admin_group; referenced by prod's restated complex vars)."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # `bundle deploy` builds the example domain wheels (`uv build --package …`,
+    # see databricks.yml artifacts) and the publish step below builds + uploads
+    # the FRAMEWORK wheel — so uv must be on PATH here. (`bundle validate` does
+    # NOT build artifacts, which is why the validate-only CI job doesn't need it.)
+    # Mirrors the CI test job's uv setup.
+    - name: Install uv
+      # Exact pin: setup-uv publishes no floating `v8` major tag (only v8.x.y);
+      # v8.2.0 is the latest and runs on Node 24. Bump on new releases.
+      uses: astral-sh/setup-uv@v8.2.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    # Publish the datalab FRAMEWORK wheel into each project catalog's
+    # `artifacts.wheels` Volume BEFORE deploy, so the version each domain
+    # references (var.datalab_wheel / var.sales_datalab_wheel) is present when a
+    # pipeline first runs. publish_wheel uploads to the per-target domain catalogs
+    # (bootstrap_uc.CATALOGS); the bundle builds only the example domain wheels. If
+    # a domain catalog is overridden (--var catalog), pass --catalog to match.
+    # PRECONDITION: each project catalog's artifacts.wheels Volume already exists —
+    # `make bootstrap-uc TARGET=<t>` provisions it. Auth is the same OIDC env the
+    # deploy uses (set at the job level); the Databricks SDK picks it up ambiently.
+    # `--with databricks-sdk` keeps the SDK out of uv.lock. No `--with pip` — the
+    # wheel is built by `uv build` from a shallow clone, so pip is never needed.
+    - name: Publish datalab framework wheel to each project catalog's volume
+      shell: bash
+      env:
+        IN_CATALOG:       ${{ inputs.catalog }}
+        IN_SALES_CATALOG: ${{ inputs.sales-catalog }}
+      run: |
+        # Build the FRAMEWORK wheel from the pinned git dep (pyproject
+        # [tool.uv.sources].datalab) into an isolated dir, then upload — never
+        # touches the bundle's dist/ (which `bundle deploy` fills with the example
+        # wheels right after). `--with databricks-sdk`
+        # uploads it; neither enters uv.lock.
+        #
+        # When a domain catalog is overridden below (--var catalog / sales_catalog),
+        # --catalog-for repoints THAT domain's upload to the same catalog, so the
+        # wheel always lands where the deployed pipeline environment will look for
+        # it (var.datalab_wheel / var.sales_datalab_wheel derive from the same vars).
+        PUBLISH_ARGS=(--target "${{ inputs.target }}" --build --apply)
+        [ -n "$IN_CATALOG" ]       && PUBLISH_ARGS+=(--catalog-for "customer_sales=$IN_CATALOG")
+        [ -n "$IN_SALES_CATALOG" ] && PUBLISH_ARGS+=(--catalog-for "sales=$IN_SALES_CATALOG")
+        uv run --with databricks-sdk python scripts/publish_wheel.py "${PUBLISH_ARGS[@]}"
+
+    # Validate and deploy in one step so the quoted --var argument array
+    # (group names may contain spaces) doesn't have to cross a step boundary.
+    - name: bundle validate + deploy
+      shell: bash
+      env:
+        GIT_SHA: ${{ github.sha }}
+        CI: "true"
+        IN_CATALOG:        ${{ inputs.catalog }}
+        IN_SALES_CATALOG:  ${{ inputs.sales-catalog }}
+        IN_LANDING_PATH:   ${{ inputs.sales-landing-path }}
+        IN_READER_GROUP:   ${{ inputs.reader-group }}
+        IN_ENGINEER_GROUP: ${{ inputs.engineer-group }}
+        IN_ADMIN_GROUP:    ${{ inputs.admin-group }}
+        AUTO_APPROVE:      ${{ inputs.auto-approve }}
+      run: |
+        ARGS=(-t "${{ inputs.target }}" -p "${{ inputs.profile }}")
+        [ -n "$IN_CATALOG" ]        && ARGS+=(--var "catalog=$IN_CATALOG")
+        [ -n "$IN_SALES_CATALOG" ]  && ARGS+=(--var "sales_catalog=$IN_SALES_CATALOG")
+        [ -n "$IN_LANDING_PATH" ]   && ARGS+=(--var "sales_landing_path=$IN_LANDING_PATH")
+        [ -n "$IN_READER_GROUP" ]   && ARGS+=(--var "reader_group=$IN_READER_GROUP")
+        [ -n "$IN_ENGINEER_GROUP" ] && ARGS+=(--var "engineer_group=$IN_ENGINEER_GROUP")
+        [ -n "$IN_ADMIN_GROUP" ]    && ARGS+=(--var "admin_group=$IN_ADMIN_GROUP")
+
+        databricks bundle validate "${ARGS[@]}"
+
+        # --auto-approve is a deploy-only flag (validate rejects it). It is added
+        # only for targets that opt in (dev) so CI can apply destructive changes
+        # without a prompt; stage/prod deploy without it and fail loudly on a
+        # destructive plan, leaving the deletion for a human to review.
+        DEPLOY_ARGS=("${ARGS[@]}")
+        [ "$AUTO_APPROVE" = "true" ] && DEPLOY_ARGS+=(--auto-approve)
+        databricks bundle deploy   "${DEPLOY_ARGS[@]}"

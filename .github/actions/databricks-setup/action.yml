@@ -1,0 +1,49 @@
+name: "Databricks Setup (OIDC)"
+description: "Install the Databricks CLI and configure github-oidc authentication for downstream bundle commands."
+
+inputs:
+  databricks-host:
+    description: "Workspace URL, e.g. https://adb-xxx.azuredatabricks.net"
+    required: true
+  databricks-client-id:
+    description: "Service principal application_id (no client_secret needed — OIDC mints a short-lived token)."
+    required: true
+  profile:
+    description: "Databricks CLI profile name to write to ~/.databrickscfg."
+    required: false
+    default: "DEFAULT"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Databricks CLI
+      # Pinned to a release tag (was @main — the one floating action in the
+      # repo, a supply-chain/reproducibility hole on the deploy path). The
+      # action installs the latest CLI by default; this repo needs CLI
+      # >= v0.294.0 (pipeline environment_version). Dependabot bumps the tag.
+      uses: databricks/setup-cli@v1.6.0
+
+    - name: Write ~/.databrickscfg and export env vars
+      shell: bash
+      run: |
+        umask 077
+        cat > "$HOME/.databrickscfg" <<EOF
+        [${{ inputs.profile }}]
+        host       = ${{ inputs.databricks-host }}
+        client_id  = ${{ inputs.databricks-client-id }}
+        auth_type  = github-oidc
+        EOF
+        chmod 600 "$HOME/.databrickscfg"
+
+        echo "DATABRICKS_HOST=${{ inputs.databricks-host }}"           >> "$GITHUB_ENV"
+        echo "DATABRICKS_CLIENT_ID=${{ inputs.databricks-client-id }}" >> "$GITHUB_ENV"
+        echo "DATABRICKS_AUTH_TYPE=github-oidc"                        >> "$GITHUB_ENV"
+        echo "DATABRICKS_CONFIG_PROFILE=${{ inputs.profile }}"         >> "$GITHUB_ENV"
+
+    - name: Verify authentication
+      shell: bash
+      run: |
+        databricks auth describe || {
+          echo "::warning::auth describe failed — OIDC federation may not be configured on the SP yet (see docs/CICD.md)."
+          exit 1
+        }

@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# Warn before committing changes to production-sensitive files in datalab.
+#
+# Companion to .claude/hooks/protected_files_guard.py: that hook fires when a
+# coding agent attempts Edit/Write; this hook fires when a human (or any git
+# client) stages a commit. Both guard the same surface — keep the PATTERNS
+# array below aligned with the PROTECTED list in the Python hook AND the
+# "Protected file surface" table in AGENTS.md.
+#
+# Enable once per clone:
+#     make enable-githooks        (git config core.hooksPath .githooks)
+#
+# Override for one commit (preferred over --no-verify because it leaves the
+# other hooks running):
+#     make commit-protected MSG="..."        (PROTECTED_EDIT_OK=1 git commit)
+
+set -euo pipefail
+
+if [[ "${PROTECTED_EDIT_OK:-}" == "1" ]]; then
+  exit 0
+fi
+
+# ---- branch-first policy (AGENTS.md "Branching & releases") -----------------
+# main only moves via PRs: direct commits on main/master are blocked. The
+# agent-side counterpart is .cursor/hooks/branch_guard.py (both harnesses).
+# symbolic-ref (not rev-parse) so the very first commit on an unborn branch
+# is caught too; detached HEAD yields "" and passes.
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || echo "")
+if [[ "$branch" == "main" || "$branch" == "master" ]]; then
+  {
+    printf '\n  COMMIT BLOCKED — you are on %s.\n\n' "$branch"
+    printf '  Every change starts from a fresh branch (feature/<slug>, fix/<slug>,\n'
+    printf '  debug/<slug>) and lands in main via a PR. Move your work over with:\n\n'
+    printf '      git switch -c <feature|fix|debug>/<slug>      # keeps staged changes\n\n'
+    printf '  (Emergency bypass, discouraged: PROTECTED_EDIT_OK=1 git commit ...)\n\n'
+  } >&2
+  exit 1
+fi
+
+# ---- the .claude/skills copy must match canonical .agents/skills ------------
+# Catches "edited .agents/skills but forgot `make sync-skills`". Cheap, stdlib.
+if [[ -f scripts/sync_skills.py ]] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 scripts/sync_skills.py --check >/dev/null 2>&1; then
+    {
+      printf '\n  COMMIT BLOCKED — the .claude/skills copy drifted from .agents/skills/.\n\n'
+      printf '  Skills are authored ONCE under .agents/skills/; the .claude/skills\n'
+      printf '  copy is generated. Regenerate and re-stage:\n\n'
+      printf '      make sync-skills\n\n'
+    } >&2
+    exit 1
+  fi
+fi
+
+# ---- CHANGELOG.md must stay releasable ---------------------------------------
+# The deploy cuts [Unreleased] into a version (scripts/release_changelog.py); a
+# malformed file or a hand-edited [project].version would only fail that cut
+# AFTER the deploy. Cheap, stdlib.
+if [[ -f scripts/release_changelog.py ]] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 scripts/release_changelog.py check >/dev/null 2>&1; then
+    {
+      printf '\n  COMMIT BLOCKED — CHANGELOG.md is not releasable.\n\n'
+      printf '  New entries go under ## [Unreleased]; versions are cut by the deploy,\n'
+      printf '  never by hand. See what is wrong:\n\n'
+      printf '      make check-changelog\n\n'
+    } >&2
+    exit 1
+  fi
+fi
+
+# ---- committed agent configs must be machine-independent --------------------
+# .claude/settings.json is tracked and ships to adopters; an absolute path or a
+# scratch-dir grant in it is inert elsewhere and leaks local paths. Personal
+# grants belong in the gitignored .claude/settings.local.json.
+if [[ -f scripts/check_agent_settings.py ]] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 scripts/check_agent_settings.py >/dev/null 2>&1; then
+    {
+      printf '\n  COMMIT BLOCKED — a committed agent config is tied to this machine.\n\n'
+      printf '  Move the offending grant to .claude/settings.local.json (gitignored,\n'
+      printf '  per-developer). See the details:\n\n'
+      printf '      make check-agent-settings\n\n'
+    } >&2
+    exit 1
+  fi
+fi
+
+# ---- the adopter templates doc must match the scaffold engine ---------------
+# references/templates.md is the documented MANUAL FALLBACK for converting a
+# repo by hand, so a drifted code block there hands the next customer a repo
+# that fails its own gates. Stdlib-only, same as the check above.
+if [[ -f scripts/check_templates_doc.py ]] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 scripts/check_templates_doc.py >/dev/null 2>&1; then
+    {
+      printf '\n  COMMIT BLOCKED — the adopter templates doc drifted from the scaffold.\n\n'
+      printf '  .agents/skills/bootstrap-adopter-repo/references/templates.md must\n'
+      printf '  mirror scripts/scaffold_adopter.py byte for byte. See the diff:\n\n'
+      printf '      make check-templates-doc\n\n'
+    } >&2
+    exit 1
+  fi
+fi
+
+# ---- the authoring skill must cover the pinned framework's surface ----------
+# A framework bump that brings a new target/source kind is not done until the
+# author-ldp-artifact skill documents it (the corresponding change). Stdlib-only.
+if [[ -f scripts/check_framework_surface.py ]] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 scripts/check_framework_surface.py >/dev/null 2>&1; then
+    {
+      printf '\n  COMMIT BLOCKED — the authoring skill misses a kind the pinned framework offers.\n\n'
+      printf '  Document it in .agents/skills/author-ldp-artifact/SKILL.md (then\n'
+      printf '  make sync-skills). See which kinds:\n\n'
+      printf '      make check-framework-surface\n\n'
+    } >&2
+    exit 1
+  fi
+fi
+
+# adopter-if:design start
+# ---- the design diagrams are generated, never hand-edited -------------------
+# design/*.drawio come from scripts/design_diagram.py (drawio-architecture-designer
+# kit). A commit touching the estate, the generator or design/ must carry
+# diagrams that match it and pass the layout audit. Needs PyYAML (the dev venv);
+# skipped without it - CI's `make check-design` still gates the PR.
+if [[ -f scripts/design_diagram.py ]]; then
+  design_touched=$(git diff --cached --name-only --diff-filter=ACMRD | grep -E \
+    '^(design/|scripts/(design_|drawio_kit/|export_design)|(projects/[^/]+/)?(config|resources)/|targets/|\.github/workflows/ci-cd\.yml$|Makefile$)' || true)
+  py=python3; [[ -x .venv/bin/python ]] && py=.venv/bin/python
+  if [[ -n "$design_touched" ]] && "$py" -c 'import yaml' >/dev/null 2>&1; then
+    if ! "$py" scripts/design_diagram.py --check >/dev/null 2>&1; then
+      {
+        printf '\n  COMMIT BLOCKED - design/*.drawio are stale, hand-edited, or fail the layout audit.\n\n'
+        printf '  The diagrams are GENERATED (never edit the XML). Regenerate, look, re-stage:\n\n'
+        printf '      make design && make design-preview\n\n'
+        printf '  See the maintain-design-diagram skill.\n\n'
+      } >&2
+      exit 1
+    fi
+  fi
+fi
+# adopter-if:design end
+
+# Entries fenced `# adopter-if:<feature>` are dropped from generated adopters
+# that did not choose the feature (scripts/scaffold_adopter.py) — the same rows
+# as AGENTS.md's table and the agent guard, so the three stay aligned there too.
+PATTERNS=(
+  '^databricks\.yml$'
+  '^rbac\.yml$'
+  '^(variables|targets)/.*\.ya?ml$'
+  '^(resources|projects/[^/]+/resources)/.*\.yml$'
+  '^pyproject\.toml$'
+  '^uv\.lock$'
+  '^\.databricksignore$'
+  '^(config|projects/[^/]+/config)/.*\.ya?ml$'
+  '^\.github/(workflows|actions)/.*'
+  # adopter-if:pr-template start
+  '^\.github/pull_request_template\.md$'
+  # adopter-if:pr-template end
+  # adopter-if:agent-claude|agent-codex start
+  '^\.claude/(settings\.json|hooks/.*|skills/.*)'
+  # adopter-if:agent-claude|agent-codex end
+  # adopter-if:hooked-agent start
+  '^\.cursor/(rules|hooks)/.*'
+  '^\.cursor/hooks\.json$'
+  # adopter-if:hooked-agent end
+  # adopter-if:any-agent start
+  '^\.codex/hooks\.json$'
+  '^\.agents/skills/.*'
+  # adopter-if:any-agent end
+  # adopter-if:agent-claude start
+  '^scripts/sync_skills\.py$'
+  # adopter-if:agent-claude end
+  '^scripts/(sync_schemas|check_lockstep|bump_framework|domains|check_sync_lists|check_templates_doc|check_adopter_docs|check_agent_settings|check_framework_current|check_framework_surface|release_changelog)\.py$'
+  # adopter-if:schemas start
+  '^schemas/.*\.json$'
+  # adopter-if:schemas end
+  # adopter-if:mcp start
+  '^\.mcp\.json$'
+  '^\.cursor/mcp\.json$'
+  # adopter-if:mcp end
+  # adopter-if:design start
+  '^scripts/(design_diagram|design_spec|design_inventory|export_design)\.py$'
+  '^scripts/drawio_kit/.*'
+  # adopter-if:design end
+  '^\.githooks/.*'
+  '^Makefile$'
+  '^\.env(\..*)?$'
+  '^(AGENTS|CLAUDE|README)\.md$'
+  '^docs/(ARCHITECTURE|CICD|MIGRATION|GETTING_STARTED|NAMING|NEW_ADOPTER|ADOPTING|AGENT_MCP)\.md$'
+)
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR || true)
+[[ -z "$staged" ]] && exit 0
+
+hits=()
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  for p in "${PATTERNS[@]}"; do
+    if [[ "$f" =~ $p ]]; then
+      hits+=("$f")
+      break
+    fi
+  done
+done <<< "$staged"
+
+if [[ ${#hits[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+{
+  printf '\n'
+  printf '  ┌──────────────────────────────────────────────────────────────────┐\n'
+  printf '  │  PROTECTED FILES staged in this commit                            │\n'
+  printf '  └──────────────────────────────────────────────────────────────────┘\n'
+  printf '\n'
+  for f in "${hits[@]}"; do
+    printf '    • %s\n' "$f"
+  done
+  cat <<'EOF'
+
+  These files are part of the production-sensitive surface (deploy config,
+  dependency manifests, CI/CD, agent harness, documents-of-record). Before
+  pushing, confirm:
+
+    • The change is captured in AGENTS.md (Common tasks or Critical knowledge).
+    • For databricks.yml / resources/*.yml — validate locally (`make validate`).
+    • For pyproject.toml — `make lock` was run and uv.lock is in the same commit.
+    • For .github/** — OIDC auth + `uv sync --frozen` semantics stay intact.
+    • For schemas/*.json — GENERATED from the pinned framework (`make sync-schemas`), never hand-edited.
+
+  This commit is BLOCKED until you acknowledge. To proceed:
+
+      make commit-protected MSG="..."           (preferred; leaves other hooks)
+      git commit --no-verify ...                (skips ALL pre-commit hooks)
+
+  If this protected list itself needs to change, update all three in the same
+  commit:
+      .githooks/pre-commit                      (this file)
+      .claude/hooks/protected_files_guard.py    (agent-side guard)
+      AGENTS.md  →  "Protected file surface" table
+EOF
+} >&2
+
+exit 1
