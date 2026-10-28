@@ -29,10 +29,12 @@ from pathlib import Path
 
 # Importable both as a module (tests) and as a script (``python alteryx_to_yaml.py``).
 try:
-    from . import depgraph, model
+    from . import classify, depgraph, emit, model
 except ImportError:  # pragma: no cover - script invocation puts this dir on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import classify  # type: ignore[no-redef]
     import depgraph  # type: ignore[no-redef]
+    import emit  # type: ignore[no-redef]
     import model  # type: ignore[no-redef]
 
 VALID_LAYERS = ("bronze", "silver", "gold")
@@ -155,11 +157,67 @@ def main(argv: list[str] | None = None) -> int:
     ctx = load(args)
     domain = args.domain or slug(ctx.workflow)
     out = Path(args.out) if args.out else Path("projects") / domain
+    catalog_conf = getattr(args, "catalog_conf", "datalab.catalog")
 
-    if args.dry_run or True:  # Task 1 only plans; emission arrives in later tasks.
+    if args.dry_run:
         print(dry_run_report(ctx, domain, out))
-        if not args.dry_run:
-            print("\n(emission not wired yet — Task 1 is parse + plan only)")
+        return 0
+
+    # Build dependency graph (fails fast before any file is written).
+    try:
+        graph = depgraph.build(ctx)
+    except depgraph.GraphError as exc:
+        raise SystemExit(f"dependency graph error: {exc}") from None
+
+    # Classify every table.
+    decisions = classify.classify_all(ctx)
+
+    written: list[Path] = []
+
+    # 1. domain.yml skeleton.
+    p = emit.emit_domain_yml(domain, out, catalog_conf=catalog_conf)
+    written.append(p)
+    print(f"  wrote {p.as_posix()}")
+
+    # 2. Bronze: emit one YAML per source entry (sources represent ingestion tables).
+    for source in ctx.sources:
+        p = emit.emit_bronze_yml(ctx, domain, source.table_key, out, catalog_conf=catalog_conf)
+        written.append(p)
+        print(f"  wrote {p.as_posix()}")
+
+    # 3. Silver / Gold tables: emit in topological order.
+    tables_by_key = {t.table: t for t in ctx.tables}
+    for key in graph.order:
+        tbl = tables_by_key.get(key)
+        if tbl is None:
+            continue  # source node, already handled above
+        td = decisions[tbl.table]
+        if tbl.layer == "silver":
+            try:
+                p = emit.emit_silver_yml(ctx, tbl, td, domain, out)
+                written.append(p)
+                print(f"  wrote {p.as_posix()}")
+            except NotImplementedError as exc:
+                print(f"  [skip] {exc}")
+        elif tbl.layer == "gold":
+            try:
+                p = emit.emit_gold_yml(ctx, tbl, td, domain, out)
+                written.append(p)
+                print(f"  wrote {p.as_posix()}")
+            except NotImplementedError as exc:
+                print(f"  [skip] {exc}")
+
+    # 4. classification.json
+    p = emit.emit_classification_json(ctx, decisions, graph, domain, out)
+    written.append(p)
+    print(f"  wrote {p.as_posix()}")
+
+    # 5. migration_review.md (stub header; full sections in Task 8)
+    p = emit.emit_review_md(ctx, decisions, graph, domain, out)
+    written.append(p)
+    print(f"  wrote {p.as_posix()}")
+
+    print(f"\n{len(written)} file(s) written to {out.as_posix()}")
     return 0
 
 
