@@ -1,0 +1,3 @@
+[submodule "migrations/alteryx"]
+	path = migrations/alteryx
+	url = https://github.com/suryadb0275/alteryx.git

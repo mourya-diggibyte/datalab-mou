@@ -1,0 +1,54 @@
+{
+  "generated_at": "2026-10-28T16:20:16.425346+00:00",
+  "workflow": "Master_ONB_BA (1).yxmd",
+  "sha256": "8f35b5c3cea42f33fd72de424f0918d15626b187702641cae09fb9579ea531ab",
+  "domain": "master_onb_ba",
+  "dependency_order": [
+    "bronze_xlsx_ba_master",
+    "gold_xlsx_ba_master_selected"
+  ],
+  "fan_in": {},
+  "fan_out": {},
+  "tables": {
+    "gold_xlsx_ba_master_selected": {
+      "layer": "gold",
+      "confidence": "medium",
+      "needs_transform": true,
+      "gaps": [],
+      "dropped": [],
+      "review_notes": [
+        "Unique (keep-first): user accepted that any matching row may be kept (no order key)",
+        "['Business Area', 'Description', 'Company code', 'Unit', 'Business Name'] are not among the incoming fields the workflow records: each is taken only if the input has it at run time (Alteryx ignores a configured field that is missing)"
+      ],
+      "tool_decisions": [
+        {
+          "tool_id": 9,
+          "name": "Unique",
+          "bucket": "transform",
+          "confidence": "medium",
+          "score": 0.6,
+          "reason": "Unique keeps 'any' matching row (no order key, decisions[].mode=any) \u2014 dropDuplicates, NOT cdc (cdc would pick a different, order-dependent survivor)",
+          "construct": "@transform: dropDuplicates (any-row semantics)"
+        },
+        {
+          "tool_id": 5,
+          "name": "Formula",
+          "bucket": "yaml",
+          "confidence": "medium",
+          "score": 0.6,
+          "reason": "Formula assigns a literal/current_timestamp/cast \u2014 a derived column",
+          "construct": "columns: derived (review expression support at the pinned framework)"
+        },
+        {
+          "tool_id": 2,
+          "name": "Select",
+          "bucket": "yaml",
+          "confidence": "high",
+          "score": 0.9,
+          "reason": "Select is a rename/cast/drop or row filter \u2014 a declarative column/rule",
+          "construct": "columns:"
+        }
+      ]
+    }
+  }
+}

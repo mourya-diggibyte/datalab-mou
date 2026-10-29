@@ -1,0 +1,74 @@
+{
+  "workflow": "silver_test.yxmd",
+  "sha256": "aaaa0000000000000000000000000000000000000000000000000000000000000000",
+  "tool_count": 3,
+  "sources": [
+    {
+      "table_key": "bronze_orders",
+      "unity_catalog_name": "bronze_orders",
+      "alteryx_tools": [1],
+      "source_tables": [],
+      "query": "",
+      "query_translated": false
+    }
+  ],
+  "tables": [
+    {
+      "table": "silver_orders",
+      "unity_catalog_name": "silver_orders",
+      "layer": "silver",
+      "container": "C",
+      "notebook": "02_silver.ipynb",
+      "status": "ok",
+      "reads_sources": ["bronze_orders"],
+      "reads_tables": [],
+      "chain": "Select [2] -> Filter [3]",
+      "tools": [1, 2, 3],
+      "spark_sql": false,
+      "no_sql_reason": "",
+      "review_notes": []
+    }
+  ],
+  "tools": [
+    {
+      "id": 1,
+      "name": "google-sheets-input",
+      "plugin": "google-sheets-input",
+      "container": "C",
+      "status": "source",
+      "missing": false,
+      "tables": [],
+      "upstream": [],
+      "downstream": [{"id": 2, "name": "Select", "from_anchor": "Output", "to_anchor": "Input"}],
+      "code": ""
+    },
+    {
+      "id": 2,
+      "name": "Select",
+      "plugin": "AlteryxBasePluginsGui.AlteryxSelect.AlteryxSelect",
+      "container": "C",
+      "status": "converted by rule",
+      "missing": false,
+      "tables": ["silver_orders"],
+      "upstream": [{"id": 1, "name": "google-sheets-input", "from_anchor": "Output", "to_anchor": "Input"}],
+      "downstream": [{"id": 3, "name": "Filter", "from_anchor": "Output", "to_anchor": "Input"}],
+      "code": "# [2] Select\nsilver_orders = bronze_orders.select(\n    F.col('order_id').cast('long').alias('order_id'),\n    F.col('customer_id').cast('long').alias('customer_id'),\n    F.col('order_date').cast('date').alias('order_date'),\n    F.col('status').alias('order_status'),\n    F.col('total').cast('double').alias('total_amount'),\n    F.col('_ingest_ts'),\n    F.col('_source_file')\n)"
+    },
+    {
+      "id": 3,
+      "name": "Filter",
+      "plugin": "AlteryxBasePluginsGui.Filter.Filter",
+      "container": "C",
+      "status": "converted by rule",
+      "missing": false,
+      "tables": ["silver_orders"],
+      "upstream": [{"id": 2, "name": "Select", "from_anchor": "Output", "to_anchor": "Input"}],
+      "downstream": [],
+      "code": "# [3] Filter\nsilver_orders = silver_orders.filter(F.col('order_id').isNotNull())"
+    }
+  ],
+  "missing": [],
+  "macros_missing": [],
+  "decisions": {},
+  "decided_for_you": {}
+}
